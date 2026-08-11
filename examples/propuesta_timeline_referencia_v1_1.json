@@ -1,0 +1,345 @@
+{
+  "proposal_id": "65907a6c-82dd-40d0-88a1-2e2ee5955aca",
+  "version": 1,
+  "template_version": "1.1",
+  "status": "NEEDS_INPUT",
+  "source_file": {
+    "name": "plan_timeline_referencia_v1_1_valido.xlsx",
+    "sha256": "9d1d3ca9734c8b6d7058931c766c2f6c8e634eccaddeef695518d04fca844329"
+  },
+  "defaults": {
+    "space": "AT",
+    "iniciativa": "Piloto timeline",
+    "linea_trabajo": null,
+    "sprint": null,
+    "tipo_seguimiento": "Semanal",
+    "semaforo": null
+  },
+  "items": [
+    {
+      "source": {
+        "source_row": 6,
+        "actividad": "Definir alcance, objetivo del reporte y preguntas de negocio",
+        "responsable_display": "Benjamín Blanco",
+        "frente_trabajo_origen": "Definiciones",
+        "contexto_resultado": "Acordar el universo de grabaciones, periodo y campañas",
+        "fecha_objetivo": "2026-07-10",
+        "estado_actual": "Completada",
+        "comentarios": "Actividad tomada como referencia del timeline de Transcripción y Análisis"
+      },
+      "generated": {
+        "row_id": "ROW-0006",
+        "create_in_jira": false,
+        "decision": "EXCLUIR",
+        "decision_reason": "La actividad está marcada como completada en el archivo fuente.",
+        "work_type": "Task",
+        "title": "Definir alcance, objetivo del reporte y preguntas de negocio",
+        "description": "Actividad: Definir alcance, objetivo del reporte y preguntas de negocio\n\nResultado esperado: Acordar el universo de grabaciones, periodo y campañas\n\nFrente de trabajo: Definiciones\n\nAntecedentes o restricciones: Actividad tomada como referencia del timeline de Transcripción y Análisis\n\nFecha objetivo informada: 2026-07-10\n\nReferencia de origen: fila 6 de la plantilla.",
+        "space": "AT",
+        "parent_row_id": null,
+        "assignee": {
+          "display_name": "Benjamín Blanco",
+          "email": "benjamin.blanco@example.com",
+          "account_id": "local-account-benjamin",
+          "resolution": "RESOLVED"
+        },
+        "fields": {
+          "iniciativa": "Piloto timeline",
+          "linea_trabajo": null,
+          "sprint": null,
+          "tipo_seguimiento": "Semanal",
+          "semaforo": null,
+          "due_date": "2026-07-10"
+        },
+        "confidence": 0.88
+      },
+      "validation": {
+        "errors": [],
+        "warnings": [
+          "La actividad describe trabajo concreto sin evidencia de otro tipo."
+        ],
+        "pending_requirements": []
+      },
+      "review": {
+        "user_modified": false,
+        "approved": false,
+        "review_note": null,
+        "confirmed_fields": [],
+        "source_state_override": null,
+        "source_state_override_reason": null,
+        "source_state_override_at": null,
+        "source_state_override_by": null,
+        "reactivation_reviewed": false
+      },
+      "execution": {
+        "idempotency_key": null,
+        "jira_issue_key": null,
+        "result": "NOT_STARTED",
+        "error_code": null
+      }
+    },
+    {
+      "source": {
+        "source_row": 7,
+        "actividad": "Habilitar accesos a la nube GCP",
+        "responsable_display": "Benjamín Blanco",
+        "frente_trabajo_origen": "Conectividad y accesos",
+        "contexto_resultado": "Contar con los accesos necesarios para las pruebas",
+        "fecha_objetivo": "2026-07-31",
+        "estado_actual": "Pendiente",
+        "comentarios": null
+      },
+      "generated": {
+        "row_id": "ROW-0007",
+        "create_in_jira": true,
+        "decision": "INCLUIR",
+        "decision_reason": "La fila cumple los campos mínimos y las reglas deterministas del MVP.",
+        "work_type": "Task",
+        "title": "Habilitar accesos a la nube GCP",
+        "description": "Actividad: Habilitar accesos a la nube GCP\n\nResultado esperado: Contar con los accesos necesarios para las pruebas\n\nFrente de trabajo: Conectividad y accesos\n\nFecha objetivo informada: 2026-07-31\n\nReferencia de origen: fila 7 de la plantilla.",
+        "space": "AT",
+        "parent_row_id": null,
+        "assignee": {
+          "display_name": "Benjamín Blanco",
+          "email": "benjamin.blanco@example.com",
+          "account_id": "local-account-benjamin",
+          "resolution": "RESOLVED"
+        },
+        "fields": {
+          "iniciativa": "Piloto timeline",
+          "linea_trabajo": null,
+          "sprint": null,
+          "tipo_seguimiento": "Semanal",
+          "semaforo": null,
+          "due_date": "2026-07-31"
+        },
+        "confidence": 0.88
+      },
+      "validation": {
+        "errors": [],
+        "warnings": [
+          "La actividad describe trabajo concreto sin evidencia de otro tipo."
+        ],
+        "pending_requirements": []
+      },
+      "review": {
+        "user_modified": false,
+        "approved": false,
+        "review_note": null,
+        "confirmed_fields": [],
+        "source_state_override": null,
+        "source_state_override_reason": null,
+        "source_state_override_at": null,
+        "source_state_override_by": null,
+        "reactivation_reviewed": false
+      },
+      "execution": {
+        "idempotency_key": null,
+        "jira_issue_key": null,
+        "result": "NOT_STARTED",
+        "error_code": null
+      }
+    },
+    {
+      "source": {
+        "source_row": 8,
+        "actividad": "Error de CORS al consultar el servicio de transcripción",
+        "responsable_display": "Raúl Gallardo",
+        "frente_trabajo_origen": "Integraciones",
+        "contexto_resultado": "La aplicación debe consultar el servicio sin bloqueo del navegador",
+        "fecha_objetivo": null,
+        "estado_actual": "Pendiente",
+        "comentarios": "Se requiere validar configuración de origen y encabezados"
+      },
+      "generated": {
+        "row_id": "ROW-0008",
+        "create_in_jira": true,
+        "decision": "INCLUIR",
+        "decision_reason": "La fila cumple los campos mínimos y las reglas deterministas del MVP.",
+        "work_type": "Bug",
+        "title": "Error de CORS al consultar el servicio de transcripción",
+        "description": "Actividad: Error de CORS al consultar el servicio de transcripción\n\nResultado esperado: La aplicación debe consultar el servicio sin bloqueo del navegador\n\nFrente de trabajo: Integraciones\n\nAntecedentes o restricciones: Se requiere validar configuración de origen y encabezados\n\nReferencia de origen: fila 8 de la plantilla.",
+        "space": "AT",
+        "parent_row_id": null,
+        "assignee": {
+          "display_name": "Raúl Gallardo",
+          "email": "raul.gallardo@example.com",
+          "account_id": "local-account-raul",
+          "resolution": "RESOLVED"
+        },
+        "fields": {
+          "iniciativa": "Piloto timeline",
+          "linea_trabajo": null,
+          "sprint": null,
+          "tipo_seguimiento": "Semanal",
+          "semaforo": null,
+          "due_date": null
+        },
+        "confidence": 0.96
+      },
+      "validation": {
+        "errors": [],
+        "warnings": [
+          "El texto describe un error, falla, defecto o incidencia."
+        ],
+        "pending_requirements": []
+      },
+      "review": {
+        "user_modified": false,
+        "approved": false,
+        "review_note": null,
+        "confirmed_fields": [],
+        "source_state_override": null,
+        "source_state_override_reason": null,
+        "source_state_override_at": null,
+        "source_state_override_by": null,
+        "reactivation_reviewed": false
+      },
+      "execution": {
+        "idempotency_key": null,
+        "jira_issue_key": null,
+        "result": "NOT_STARTED",
+        "error_code": null
+      }
+    },
+    {
+      "source": {
+        "source_row": 9,
+        "actividad": "Definir estrategia de anonimización de datos sensibles",
+        "responsable_display": "Wilfrido / José",
+        "frente_trabajo_origen": "Definición y diseño",
+        "contexto_resultado": "Proteger datos sensibles antes del análisis",
+        "fecha_objetivo": "2026-08-07",
+        "estado_actual": "Por confirmar",
+        "comentarios": "Se requiere confirmar un responsable principal"
+      },
+      "generated": {
+        "row_id": "ROW-0009",
+        "create_in_jira": false,
+        "decision": "REVISAR",
+        "decision_reason": "Pendientes por resolver: Selecciona un responsable disponible en el catálogo. Confirma que la actividad sigue vigente.",
+        "work_type": "Task",
+        "title": "Definir estrategia de anonimización de datos sensibles",
+        "description": "Actividad: Definir estrategia de anonimización de datos sensibles\n\nResultado esperado: Proteger datos sensibles antes del análisis\n\nFrente de trabajo: Definición y diseño\n\nAntecedentes o restricciones: Se requiere confirmar un responsable principal\n\nFecha objetivo informada: 2026-08-07\n\nReferencia de origen: fila 9 de la plantilla.",
+        "space": "AT",
+        "parent_row_id": null,
+        "assignee": {
+          "display_name": "Wilfrido / José",
+          "email": null,
+          "account_id": null,
+          "resolution": "NOT_FOUND"
+        },
+        "fields": {
+          "iniciativa": "Piloto timeline",
+          "linea_trabajo": null,
+          "sprint": null,
+          "tipo_seguimiento": "Semanal",
+          "semaforo": null,
+          "due_date": "2026-08-07"
+        },
+        "confidence": 0.88
+      },
+      "validation": {
+        "errors": [],
+        "warnings": [
+          "La actividad describe trabajo concreto sin evidencia de otro tipo."
+        ],
+        "pending_requirements": [
+          {
+            "code": "ASSIGNEE_UNRESOLVED",
+            "field": "assignee_account_id",
+            "message": "Selecciona un responsable disponible en el catálogo."
+          },
+          {
+            "code": "SOURCE_STATE_UNCONFIRMED",
+            "field": "confirm_source_state",
+            "message": "Confirma que la actividad sigue vigente."
+          }
+        ]
+      },
+      "review": {
+        "user_modified": false,
+        "approved": false,
+        "review_note": null,
+        "confirmed_fields": [],
+        "source_state_override": null,
+        "source_state_override_reason": null,
+        "source_state_override_at": null,
+        "source_state_override_by": null,
+        "reactivation_reviewed": false
+      },
+      "execution": {
+        "idempotency_key": null,
+        "jira_issue_key": null,
+        "result": "NOT_STARTED",
+        "error_code": null
+      }
+    },
+    {
+      "source": {
+        "source_row": 10,
+        "actividad": "Construir dashboard de resultados",
+        "responsable_display": "Alfredo Aguilera",
+        "frente_trabajo_origen": "Generación de reportes",
+        "contexto_resultado": "Publicar métricas y niveles de agregación acordados",
+        "fecha_objetivo": "2026-08-14",
+        "estado_actual": "Pendiente",
+        "comentarios": null
+      },
+      "generated": {
+        "row_id": "ROW-0010",
+        "create_in_jira": true,
+        "decision": "INCLUIR",
+        "decision_reason": "La fila cumple los campos mínimos y las reglas deterministas del MVP.",
+        "work_type": "Task",
+        "title": "Construir dashboard de resultados",
+        "description": "Actividad: Construir dashboard de resultados\n\nResultado esperado: Publicar métricas y niveles de agregación acordados\n\nFrente de trabajo: Generación de reportes\n\nFecha objetivo informada: 2026-08-14\n\nReferencia de origen: fila 10 de la plantilla.",
+        "space": "AT",
+        "parent_row_id": null,
+        "assignee": {
+          "display_name": "Alfredo Aguilera",
+          "email": "alfredo.aguilera@example.com",
+          "account_id": "local-account-alfredo",
+          "resolution": "RESOLVED"
+        },
+        "fields": {
+          "iniciativa": "Piloto timeline",
+          "linea_trabajo": null,
+          "sprint": null,
+          "tipo_seguimiento": "Semanal",
+          "semaforo": null,
+          "due_date": "2026-08-14"
+        },
+        "confidence": 0.88
+      },
+      "validation": {
+        "errors": [],
+        "warnings": [
+          "La actividad describe trabajo concreto sin evidencia de otro tipo."
+        ],
+        "pending_requirements": []
+      },
+      "review": {
+        "user_modified": false,
+        "approved": false,
+        "review_note": null,
+        "confirmed_fields": [],
+        "source_state_override": null,
+        "source_state_override_reason": null,
+        "source_state_override_at": null,
+        "source_state_override_by": null,
+        "reactivation_reviewed": false
+      },
+      "execution": {
+        "idempotency_key": null,
+        "jira_issue_key": null,
+        "result": "NOT_STARTED",
+        "error_code": null
+      }
+    }
+  ],
+  "created_at": "2026-07-17T01:25:45.933858Z",
+  "created_by": "evidencia-local@agentejira.local",
+  "approved_at": null,
+  "approved_by": null
+}

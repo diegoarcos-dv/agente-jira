@@ -1,0 +1,27 @@
+{
+  "policy_version": "1.0",
+  "mode": "CONTROLLED_BATCH",
+  "jira_write_enabled": true,
+  "allowed_spaces": ["AT"],
+  "allowed_work_types": ["Task"],
+  "max_items_per_execution": 5,
+  "title_prefix": "AgenteTest_Task_",
+  "required_write_tool": "createJiraIssue",
+  "blocked_write_tools": [
+    "addCommentToJiraIssue",
+    "addWorklogToJiraIssue",
+    "editJiraIssue",
+    "transitionJiraIssue"
+  ],
+  "require_current_approved_version": true,
+  "require_current_dry_run": true,
+  "require_zero_dry_run_blockers": true,
+  "require_exact_active_account": true,
+  "require_assignee_in_atomic_create": true,
+  "require_second_confirmation": true,
+  "require_readback": true,
+  "automatic_retry": false,
+  "execution_timeout_seconds": 90,
+  "test_label": "agente-test",
+  "allowed_environment": "local"
+}

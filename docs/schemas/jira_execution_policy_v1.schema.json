@@ -1,0 +1,75 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://agentejira.local/schemas/jira_execution_policy_v1.schema.json",
+  "title": "Política de ejecución controlada Jira v1",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "policy_version",
+    "mode",
+    "jira_write_enabled",
+    "allowed_spaces",
+    "allowed_work_types",
+    "max_items_per_execution",
+    "title_prefix",
+    "required_write_tool",
+    "blocked_write_tools",
+    "require_current_approved_version",
+    "require_current_dry_run",
+    "require_zero_dry_run_blockers",
+    "require_exact_active_account",
+    "require_assignee_in_atomic_create",
+    "require_second_confirmation",
+    "require_readback",
+    "automatic_retry",
+    "execution_timeout_seconds",
+    "test_label",
+    "allowed_environment"
+  ],
+  "properties": {
+    "policy_version": { "const": "1.0" },
+    "mode": { "enum": ["PLANNING_ONLY", "SINGLE_CANARY", "CONTROLLED_BATCH", "CONTROLLED_MULTI_TYPE_BATCH", "CONTROLLED_HIERARCHY_BATCH"] },
+    "jira_write_enabled": { "type": "boolean" },
+    "allowed_spaces": {
+      "type": "array",
+      "minItems": 1,
+      "maxItems": 1,
+      "uniqueItems": true,
+      "items": { "const": "AT" }
+    },
+    "allowed_work_types": {
+      "type": "array",
+      "minItems": 1,
+      "maxItems": 5,
+      "uniqueItems": true,
+      "items": { "enum": ["Task", "Bug", "Story", "Epic", "Subtask"] }
+    },
+    "max_items_per_execution": { "type": "integer", "minimum": 1, "maximum": 5 },
+    "title_prefix": { "enum": ["AgenteTest_Task_", "AgenteTest_"] },
+    "required_write_tool": { "const": "createJiraIssue" },
+    "blocked_write_tools": {
+      "type": "array",
+      "minItems": 4,
+      "uniqueItems": true,
+      "items": {
+        "enum": [
+          "addCommentToJiraIssue",
+          "addWorklogToJiraIssue",
+          "editJiraIssue",
+          "transitionJiraIssue"
+        ]
+      }
+    },
+    "require_current_approved_version": { "const": true },
+    "require_current_dry_run": { "const": true },
+    "require_zero_dry_run_blockers": { "const": true },
+    "require_exact_active_account": { "const": true },
+    "require_assignee_in_atomic_create": { "const": true },
+    "require_second_confirmation": { "const": true },
+    "require_readback": { "const": true },
+    "automatic_retry": { "const": false },
+    "execution_timeout_seconds": { "type": "integer", "minimum": 30, "maximum": 120 },
+    "test_label": { "const": "agente-test" },
+    "allowed_environment": { "const": "local" }
+  }
+}

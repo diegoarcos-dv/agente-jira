@@ -1,0 +1,75 @@
+{
+  "artifact": "plantilla_plan_trabajo_jira_v1_1.xlsx",
+  "artifact_type": "xlsx",
+  "template_version": "1.1",
+  "status": "FROZEN",
+  "frozen_at": "2026-07-16",
+  "sha256": "9a4b913d55a27afdbee04efbc011ed134b394190eeaf968e94b2150b010f4204",
+  "contract": {
+    "capture_sheet": "PLAN_DE_TRABAJO",
+    "header_row": 5,
+    "data_first_row": 6,
+    "data_last_row": 55,
+    "columns": [
+      {
+        "position": "A",
+        "name": "Actividad *",
+        "required": true
+      },
+      {
+        "position": "B",
+        "name": "Responsable *",
+        "required": true
+      },
+      {
+        "position": "C",
+        "name": "Frente_de_trabajo_o_Proyecto",
+        "required": false
+      },
+      {
+        "position": "D",
+        "name": "Contexto_o_Resultado",
+        "required": false
+      },
+      {
+        "position": "E",
+        "name": "Fecha_Objetivo",
+        "required": false
+      },
+      {
+        "position": "F",
+        "name": "Estado_Actual",
+        "required": false,
+        "allowed_values": [
+          "Pendiente",
+          "En curso",
+          "En pausa",
+          "Completada",
+          "Rechazada",
+          "Por confirmar"
+        ]
+      },
+      {
+        "position": "G",
+        "name": "Comentarios",
+        "required": false
+      }
+    ],
+    "supporting_sheets": [
+      "AYUDA",
+      "EJEMPLO_MIGRADO"
+    ],
+    "plan_level_values": [
+      "Space",
+      "Iniciativa",
+      "Linea de trabajo",
+      "Sprint",
+      "Tipo de seguimiento",
+      "Semaforo"
+    ]
+  },
+  "change_policy": {
+    "compatible_changes": "Correcciones documentales que no alteren encabezados, obligatoriedad, semantica ni validaciones.",
+    "incompatible_changes": "Cualquier cambio incompatible requiere publicar una version posterior; la v1.1 no se reemplaza silenciosamente."
+  }
+}

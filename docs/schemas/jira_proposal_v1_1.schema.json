@@ -1,0 +1,170 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://interno.example/schemas/jira-proposal-v1-1.schema.json",
+  "title": "Propuesta controlada de work items Jira v1.1",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["proposal_id", "version", "template_version", "status", "source_file", "defaults", "items"],
+  "properties": {
+    "proposal_id": { "type": "string", "format": "uuid" },
+    "version": { "type": "integer", "minimum": 1 },
+    "template_version": { "const": "1.1" },
+    "status": {
+      "enum": ["UPLOADED", "NORMALIZED", "NEEDS_INPUT", "DRAFT", "VALIDATED", "APPROVED", "EXECUTING", "PARTIAL_SUCCESS", "COMPLETED", "FAILED", "CANCELLED"]
+    },
+    "source_file": { "$ref": "#/$defs/source_file" },
+    "defaults": { "$ref": "#/$defs/defaults" },
+    "items": { "type": "array", "minItems": 1, "items": { "$ref": "#/$defs/item" } },
+    "created_at": { "type": "string", "format": "date-time" },
+    "created_by": { "type": "string", "minLength": 1 },
+    "approved_at": { "type": ["string", "null"], "format": "date-time" },
+    "approved_by": { "type": ["string", "null"] }
+  },
+  "$defs": {
+    "source_file": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["name", "sha256"],
+      "properties": {
+        "name": { "type": "string", "minLength": 1 },
+        "sha256": { "type": "string", "pattern": "^[a-fA-F0-9]{64}$" }
+      }
+    },
+    "defaults": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["space"],
+      "properties": {
+        "space": { "enum": ["AT", "ASIT", "MTTI"] },
+        "iniciativa": { "type": ["string", "null"] },
+        "linea_trabajo": { "type": ["string", "null"] },
+        "sprint": { "type": ["string", "null"] },
+        "tipo_seguimiento": { "type": ["string", "null"] },
+        "semaforo": { "type": ["string", "null"] }
+      }
+    },
+    "source": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["source_row", "actividad", "responsable_display", "estado_actual"],
+      "properties": {
+        "source_row": { "type": "integer", "minimum": 6 },
+        "actividad": { "type": "string", "minLength": 1 },
+        "responsable_display": { "type": "string", "minLength": 1 },
+        "frente_trabajo_origen": { "type": ["string", "null"] },
+        "contexto_resultado": { "type": ["string", "null"] },
+        "fecha_objetivo": { "type": ["string", "null"], "format": "date" },
+        "estado_actual": { "enum": ["Pendiente", "En curso", "En pausa", "Completada", "Rechazada", "Por confirmar"] },
+        "comentarios": { "type": ["string", "null"] }
+      }
+    },
+    "assignee": {
+      "type": ["object", "null"],
+      "additionalProperties": false,
+      "required": ["display_name", "email", "account_id", "resolution"],
+      "properties": {
+        "display_name": { "type": "string", "minLength": 1 },
+        "email": { "type": ["string", "null"], "format": "email" },
+        "account_id": { "type": ["string", "null"] },
+        "resolution": { "enum": ["RESOLVED", "AMBIGUOUS", "NOT_FOUND", "INACTIVE"] }
+      }
+    },
+    "jira_fields": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "iniciativa": { "type": ["string", "null"] },
+        "linea_trabajo": { "type": ["string", "null"] },
+        "sprint": { "type": ["string", "null"] },
+        "tipo_seguimiento": { "type": ["string", "null"] },
+        "semaforo": { "type": ["string", "null"] },
+        "due_date": { "type": ["string", "null"], "format": "date" }
+      }
+    },
+    "generated": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["row_id", "create_in_jira", "decision", "decision_reason", "work_type", "title", "description", "space", "fields", "confidence"],
+      "properties": {
+        "row_id": { "type": "string", "pattern": "^ROW-[0-9]{4,}$" },
+        "create_in_jira": { "type": "boolean" },
+        "decision": { "enum": ["INCLUIR", "REVISAR", "EXCLUIR"] },
+        "decision_reason": { "type": "string", "minLength": 1 },
+        "work_type": { "enum": ["Epic", "Story", "Task", "Bug", "Subtask"] },
+        "title": { "type": "string", "minLength": 1 },
+        "description": { "type": "string", "minLength": 1 },
+        "space": { "enum": ["AT", "ASIT", "MTTI"] },
+        "parent_row_id": { "type": ["string", "null"], "pattern": "^ROW-[0-9]{4,}$" },
+        "assignee": { "$ref": "#/$defs/assignee" },
+        "fields": { "$ref": "#/$defs/jira_fields" },
+        "confidence": { "type": "number", "minimum": 0, "maximum": 1 }
+      }
+    },
+    "validation": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["errors", "warnings"],
+      "properties": {
+        "errors": { "type": "array", "items": { "type": "string" } },
+        "warnings": { "type": "array", "items": { "type": "string" } },
+        "pending_requirements": {
+          "type": "array",
+          "items": { "$ref": "#/$defs/review_requirement" }
+        }
+      }
+    },
+    "review_requirement": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["code", "field", "message"],
+      "properties": {
+        "code": { "type": "string", "minLength": 1 },
+        "field": { "type": "string", "minLength": 1 },
+        "message": { "type": "string", "minLength": 1 }
+      }
+    },
+    "review": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["user_modified", "approved"],
+      "properties": {
+        "user_modified": { "type": "boolean" },
+        "approved": { "type": "boolean" },
+        "review_note": { "type": ["string", "null"] },
+        "confirmed_fields": {
+          "type": "array",
+          "uniqueItems": true,
+          "items": { "enum": ["source_state", "work_type"] }
+        },
+        "source_state_override": { "type": ["string", "null"], "enum": ["ACTIVE", null] },
+        "source_state_override_reason": { "type": ["string", "null"] },
+        "source_state_override_at": { "type": ["string", "null"], "format": "date-time" },
+        "source_state_override_by": { "type": ["string", "null"] },
+        "reactivation_reviewed": { "type": "boolean" }
+      }
+    },
+    "execution": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["result"],
+      "properties": {
+        "idempotency_key": { "type": ["string", "null"] },
+        "jira_issue_key": { "type": ["string", "null"] },
+        "result": { "enum": ["NOT_STARTED", "CREATED", "SKIPPED", "FAILED"] },
+        "error_code": { "type": ["string", "null"] }
+      }
+    },
+    "item": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["source", "generated", "validation", "review", "execution"],
+      "properties": {
+        "source": { "$ref": "#/$defs/source" },
+        "generated": { "$ref": "#/$defs/generated" },
+        "validation": { "$ref": "#/$defs/validation" },
+        "review": { "$ref": "#/$defs/review" },
+        "execution": { "$ref": "#/$defs/execution" }
+      }
+    }
+  }
+}

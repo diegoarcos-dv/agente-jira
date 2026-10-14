@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from typing import Literal
+from datetime import date
 
 from pydantic import BaseModel, ConfigDict, Field
 
@@ -16,9 +17,10 @@ class LoginRequest(BaseModel):
 
 
 class SessionResponse(BaseModel):
-    access_token: str
+    access_token: str = ""
     token_type: Literal["bearer"] = "bearer"
     user: dict[str, str]
+    session_token: str | None = None
 
 
 class PlanDefaults(BaseModel):
@@ -44,6 +46,7 @@ class ItemUpdate(BaseModel):
     title: str | None = Field(default=None, min_length=1)
     description: str | None = Field(default=None, min_length=1)
     work_type: WorkType | None = None
+    tipo_seguimiento: str | None = None
     decision: Decision | None = None
     decision_reason: str | None = Field(default=None, min_length=1)
     review_note: str | None = None
@@ -53,6 +56,27 @@ class ItemUpdate(BaseModel):
     confirm_source_state: bool = False
     confirm_work_type: bool = False
     confirm_reactivation: bool = False
+    responsible_candidate_text: str | None = Field(default=None, max_length=200)
+    area_responsable: str | None = Field(default=None, max_length=120)
+    due_date_candidate: date | None = None
+    project_or_front: str | None = Field(default=None, max_length=300)
+    context: str | None = Field(default=None, max_length=4000)
+    comments: str | None = Field(default=None, max_length=2000)
+
+
+class BulkProposalUpdate(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    field: Literal["tipo_seguimiento", "work_type", "sprint"]
+    value: str = Field(min_length=1, max_length=200)
+    row_ids: list[str] | None = Field(default=None, max_length=50)
+
+
+class ProposalExclusionRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    row_ids: list[str] = Field(min_length=1, max_length=50)
+    reason: str = Field(min_length=5, max_length=500)
 
 
 class ProposalMetadataUpdate(BaseModel):
@@ -119,5 +143,9 @@ class ProposalSummary(BaseModel):
     archived: bool = False
     archived_at: str | None = None
     archived_by: str | None = None
+    deleted: bool = False
+    deleted_at: str | None = None
+    deleted_by: str | None = None
+    purge_at: str | None = None
     display_name_updated_at: str | None = None
     display_name_updated_by: str | None = None

@@ -1,10 +1,10 @@
 {
   "policy_version": "1.0",
-  "mode": "PLANNING_ONLY",
-  "jira_write_enabled": false,
+  "mode": "CONTROLLED_BATCH",
+  "jira_write_enabled": true,
   "allowed_spaces": ["AT"],
   "allowed_work_types": ["Task"],
-  "max_items_per_execution": 1,
+  "max_items_per_execution": 5,
   "title_prefix": "AgenteTest_Task_",
   "required_write_tool": "createJiraIssue",
   "blocked_write_tools": [

@@ -2,6 +2,9 @@ $ErrorActionPreference = "Stop"
 $Root = Split-Path -Parent $PSScriptRoot
 $Python = Join-Path $Root ".venv\Scripts\python.exe"
 
+& (Join-Path $PSScriptRoot 'doctor.ps1')
+if ($LASTEXITCODE -ne 0) { throw "No se pudo iniciar Agente Jira. Corrige el diagnóstico anterior." }
+
 if (-not (Test-Path $Python)) {
     throw "No existe .venv. Ejecuta primero .\scripts\setup.ps1"
 }
@@ -23,4 +26,3 @@ finally {
         Stop-Process -Id $backend.Id
     }
 }
-

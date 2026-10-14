@@ -3,6 +3,9 @@ $Root = Split-Path -Parent $PSScriptRoot
 $Python = Join-Path $Root ".venv\Scripts\python.exe"
 $Policy = Join-Path $Root "config\jira_execution_policy_4b.json"
 
+& (Join-Path $PSScriptRoot 'doctor.ps1')
+if ($LASTEXITCODE -ne 0) { throw "No se pudo iniciar Agente Jira 4B. Corrige el diagnóstico anterior." }
+
 try {
     Invoke-RestMethod -Uri "http://127.0.0.1:8000/api/health" -TimeoutSec 2 | Out-Null
     throw "El puerto 8000 ya esta ocupado. Deten la instancia actual con Ctrl+C antes de iniciar el modo 4B."

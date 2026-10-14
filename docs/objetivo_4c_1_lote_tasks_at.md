@@ -23,7 +23,7 @@ Cada actividad conserva su clave idempotente, se crea individualmente y se consu
 1. La propuesta debe estar aprobada y tener un Dry run vigente con cero bloqueos.
 2. El usuario selecciona entre una y cinco Tasks elegibles.
 3. La aplicación prepara el lote sin escribir y muestra el orden, responsable y Sprint.
-4. El usuario escribe la frase exacta `CREAR N TASKS EN AT`.
+4. El usuario confirma con la frase dinámica que muestra la aplicación para el lote actual.
 5. Antes de la primera creación se actualiza el catálogo de Sprints y se valida cada ID.
 6. Las Tasks se crean secuencialmente mediante `createJiraIssue`.
 7. Después de cada creación se llama `getJiraIssue` y se comparan los campos núcleo.

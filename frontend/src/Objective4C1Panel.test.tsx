@@ -1,4 +1,4 @@
-import { cleanup, render, screen } from "@testing-library/react";
+import { cleanup, render, screen, within } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 import { afterEach, expect, it, vi } from "vitest";
 import { Objective4C1Panel } from "./App";
@@ -9,7 +9,7 @@ afterEach(() => {
   vi.unstubAllGlobals();
 });
 
-it("crea un lote 4C.1 sólo después de selección y confirmación explícitas", async () => {
+it("crea un lote 4C.1 con preparación automática y una sola confirmación explícita", async () => {
   const proposal = { proposal_id: "batch-1", version: 8, status: "APPROVED" } as unknown as Proposal;
   const dryRun = {
     dry_run_id: "DRY-batch", proposal_id: "batch-1", proposal_version: 8,
@@ -30,7 +30,7 @@ it("crea un lote 4C.1 sólo después de selección y confirmación explícitas",
     objective: "4C.1", mode: "CONTROLLED_TASK_BATCH", execution_id: "BAT-1", status: "BATCH_PREPARED",
     proposal_id: "batch-1", proposal_version: 8, dry_run_id: "DRY-batch", payload_hash: "a".repeat(64),
     confirmation_phrase: "CREAR 2 TASKS EN AT",
-    confirmation: { required: true, expires_at: "2026-07-20T19:00:00Z", confirmed_at: null, confirmed_by: null },
+    confirmation: { required: true, expires_at: "2099-07-20T19:00:00Z", confirmed_at: null, confirmed_by: null },
     items, summary: { total: 2, created_verified: 0 }, real_mcp_calls: 0, automatic_retries: 0,
   };
   const confirmed: Objective4C1Batch = { ...prepared, status: "BATCH_CONFIRMED", confirmation: { ...prepared.confirmation, confirmed_at: "2026-07-20T18:01:00Z", confirmed_by: "tester" } };
@@ -55,22 +55,20 @@ it("crea un lote 4C.1 sólo después de selección y confirmación explícitas",
     }
     if (url.endsWith("/objective-4c1/prepare")) return { ok: true, json: async () => prepared } as Response;
     if (url.endsWith("/confirm") && options?.method === "POST") return { ok: true, json: async () => confirmed } as Response;
+    if (url.endsWith("/jira/write-lock/unlock") && options?.method === "POST") return { ok: true, json: async () => ({ state: "UNLOCKED_TEMPORARY" }) } as Response;
     if (url.endsWith("/execute") && options?.method === "POST") return { ok: true, json: async () => completed } as Response;
     return { ok: false, status: 404, json: async () => ({ detail: "Ruta inesperada" }) } as Response;
   }));
 
   render(<Objective4C1Panel token="token" proposal={proposal} dryRun={dryRun} onNewProposal={() => undefined} />);
-  expect(await screen.findByRole("heading", { name: "Crear un lote controlado de Tasks" })).toBeInTheDocument();
-  expect(await screen.findByLabelText("Avance del plan")).toHaveTextContent("2 pendientes");
-  await userEvent.click(screen.getByRole("button", { name: "Preparar lote de 2 Tasks" }));
   expect(await screen.findByText("Se crearán 2 Tasks reales en AT, en este orden")).toBeInTheDocument();
-  await userEvent.type(screen.getByLabelText("Frase de confirmación del lote"), "CREAR 2 TASKS EN AT");
-  await userEvent.click(screen.getByRole("button", { name: "Confirmar lote real" }));
-  await userEvent.click(await screen.findByRole("button", { name: "Crear 2 Tasks reales en AT" }));
+  await userEvent.click(screen.getByLabelText(/Confirmo que revisé estas actividades/));
+  await userEvent.click(screen.getByRole("button", { name: "Crear 2 Tasks en Jira" }));
+  const confirmationDialog = await screen.findByRole("dialog", { name: "Escribir actividades en Jira" });
+  await userEvent.click(within(confirmationDialog).getByRole("button", { name: "Escribir en Jira" }));
   expect(await screen.findByText("Éxito: 2 Tasks creadas y verificadas")).toBeInTheDocument();
   expect(screen.getByText("4 llamadas MCP · 0 reintentos")).toBeInTheDocument();
-  await userEvent.click(screen.getByRole("button", { name: "Preparar siguiente lote" }));
-  expect(screen.getByRole("button", { name: "Preparar lote de 1 Task" })).toBeInTheDocument();
+  expect(screen.getByRole("button", { name: "Preparar siguiente lote" })).toBeInTheDocument();
 });
 
 it("prepara un lote 4D mixto con Task, Bug y Story", async () => {
@@ -89,7 +87,7 @@ it("prepara un lote 4D mixto con Task, Bug y Story", async () => {
     objective: "4D", mode: "CONTROLLED_WORK_ITEM_BATCH", execution_id: "BAT-MIXED", status: "BATCH_PREPARED",
     proposal_id: "mixed-1", proposal_version: 9, dry_run_id: "DRY-mixed", payload_hash: "d".repeat(64),
     confirmation_phrase: "CREAR 3 ACTIVIDADES EN AT",
-    confirmation: { required: true, expires_at: "2026-07-20T20:00:00Z", confirmed_at: null, confirmed_by: null },
+    confirmation: { required: true, expires_at: "2099-07-20T20:00:00Z", confirmed_at: null, confirmed_by: null },
     items: dryRun.items.map((item, index) => ({
       position: index + 1, row_id: item.row_id, idempotency_key: item.idempotency_key!, status: "PENDING",
       payload_hash: String(index + 3).repeat(64),
@@ -112,14 +110,13 @@ it("prepara un lote 4D mixto con Task, Bug y Story", async () => {
   }));
 
   render(<Objective4C1Panel token="token" proposal={proposal} dryRun={dryRun} onNewProposal={() => undefined} allowedWorkTypes={["Task", "Bug", "Story"]} />);
-  await userEvent.click(await screen.findByRole("button", { name: "Preparar lote de 3 actividades" }));
   expect(await screen.findByText("Se crearán 3 actividades reales en AT, en este orden")).toBeInTheDocument();
-  expect(screen.getByText("CREAR 3 ACTIVIDADES EN AT")).toBeInTheDocument();
+  expect(screen.getByLabelText(/Confirmo que revisé estas actividades/)).toBeInTheDocument();
   expect(screen.getByText(/Bug · Persona 2/)).toBeInTheDocument();
   expect(screen.getByText(/Story · Persona 3/)).toBeInTheDocument();
 });
 
-it("mantiene juntas las dependencias 4E y muestra el orden padre-hijo antes de confirmar", async () => {
+it("prepara automáticamente las dependencias 4E y muestra el orden padre-hijo antes de confirmar", async () => {
   const proposal = { proposal_id: "hierarchy-1", version: 10, status: "APPROVED" } as unknown as Proposal;
   const definitions = [
     ["ROW-0006", "Epic", "Epic principal", null],
@@ -140,7 +137,7 @@ it("mantiene juntas las dependencias 4E y muestra el orden padre-hijo antes de c
     objective: "4E", mode: "CONTROLLED_HIERARCHY_BATCH", execution_id: "BAT-H", status: "BATCH_PREPARED",
     proposal_id: "hierarchy-1", proposal_version: 10, dry_run_id: "DRY-hierarchy", payload_hash: "e".repeat(64),
     confirmation_phrase: "CREAR 4 ACTIVIDADES EN AT",
-    confirmation: { required: true, expires_at: "2026-07-21T20:00:00Z", confirmed_at: null, confirmed_by: null },
+    confirmation: { required: true, expires_at: "2099-07-21T20:00:00Z", confirmed_at: null, confirmed_by: null },
     items: definitions.map(([rowId, workType, title, parentRowId], index) => ({
       position: index + 1, row_id: rowId, idempotency_key: `AJI-H-${index + 1}`, status: "PENDING",
       payload_hash: String(index + 5).repeat(64),
@@ -172,18 +169,8 @@ it("mantiene juntas las dependencias 4E y muestra el orden padre-hijo antes de c
     token="token" proposal={proposal} dryRun={dryRun} onNewProposal={() => undefined}
     allowedWorkTypes={["Task", "Bug", "Story", "Epic", "Subtask"]}
   />);
-  expect(await screen.findByRole("heading", { name: "Crear actividades y sus relaciones" })).toBeInTheDocument();
-  const epic = screen.getByRole("checkbox", { name: /Epic principal/ });
-  const story = screen.getByRole("checkbox", { name: /Story hija/ });
-  await userEvent.click(epic);
-  expect(epic).not.toBeChecked();
-  expect(story).not.toBeChecked();
-  await userEvent.click(story);
-  expect(epic).toBeChecked();
-  expect(story).toBeChecked();
-  await userEvent.click(screen.getByRole("button", { name: "Preparar lote de 4 actividades" }));
   expect(await screen.findByText("Se crearán 4 actividades reales en AT, en este orden")).toBeInTheDocument();
-  expect(screen.getByText("CREAR 4 ACTIVIDADES EN AT")).toBeInTheDocument();
+  expect(screen.getByLabelText(/Confirmo que revisé estas actividades/)).toBeInTheDocument();
   expect(screen.getByText(/Story · Persona 2 · Padre ROW-0006/)).toBeInTheDocument();
   expect(screen.getByText(/Subtask · Persona 4 · Padre ROW-0008/)).toBeInTheDocument();
 });

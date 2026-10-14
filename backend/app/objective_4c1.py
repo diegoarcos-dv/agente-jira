@@ -3,9 +3,11 @@ from __future__ import annotations
 import copy
 import hashlib
 import json
+from collections.abc import Callable
 from datetime import UTC, datetime, timedelta
-from typing import Any, Callable, Protocol
+from typing import Any, ClassVar, Protocol
 
+from .controlled_jira import ControlledJiraCreateCore
 from .execution_policy import JiraExecutionPolicy
 from .hierarchy import JiraHierarchyError, ordered_row_ids, validate_parent_relation
 from .objective_4a import _summary_slug
@@ -41,7 +43,7 @@ def _iso(value: datetime) -> str:
 
 
 def _parse_iso(value: str) -> datetime:
-    return datetime.fromisoformat(value.replace("Z", "+00:00")).astimezone(UTC)
+    return datetime.fromisoformat(value).astimezone(UTC)
 
 
 def _hash(value: Any) -> str:
@@ -53,7 +55,7 @@ class JiraControlledBatchService:
     """Creates a bounded AT/Task batch sequentially and stops on the first anomaly."""
 
     CONFIRMATION_TTL = timedelta(minutes=10)
-    TERMINAL_STATUSES = {
+    TERMINAL_STATUSES: ClassVar[set[str]] = {
         "COMPLETED",
         "STOPPED_REJECTED",
         "STOPPED_UNKNOWN",
@@ -66,11 +68,13 @@ class JiraControlledBatchService:
         policy: JiraExecutionPolicy,
         gateway: ControlledJiraBatchGateway,
         now: Callable[[], datetime] = _utc_now,
+        create_core: ControlledJiraCreateCore | None = None,
     ) -> None:
         self.repository = repository
         self.policy = policy
         self.gateway = gateway
         self.now = now
+        self.create_core = create_core or ControlledJiraCreateCore(gateway)
 
     @property
     def objective(self) -> str:
@@ -380,6 +384,29 @@ class JiraControlledBatchService:
         intent["audit"].append(self._audit("BATCH_CONFIRMED", username, now, "BATCH_CONFIRMED"))
         return self.repository.update_execution_intent(intent)
 
+    async def revalidate(self, execution_id: str, username: str) -> dict[str, Any]:
+        """Renew an expired batch authorization using read-only checks only."""
+        intent = self._owned(execution_id, username)
+        if intent.get("status") not in {"BATCH_PREPARED", "BATCH_CONFIRMED"}:
+            raise Objective4C1Error("La propuesta ya no está pendiente de verificación.")
+        proposal, dry_run = self._current_documents(intent["proposal_id"], intent)
+        # Reuse the same final checks used immediately before creation. Sprint
+        # validation only reads Jira and never invokes createJiraIssue.
+        await self._revalidate_all_sprints(intent, username, audit_event="BATCH_REVALIDATED")
+        now = self.now()
+        intent["proposal_version"] = proposal["version"]
+        intent["dry_run_id"] = dry_run["dry_run_id"]
+        intent["confirmation"] = {
+            "required": True,
+            "expires_at": _iso(now + self.CONFIRMATION_TTL),
+            "confirmed_at": None,
+            "confirmed_by": None,
+        }
+        intent["status"] = "BATCH_PREPARED"
+        intent["updated_at"] = _iso(now)
+        intent.setdefault("audit", []).append(self._audit("BATCH_REVALIDATED", username, now, "READ_ONLY_REVALIDATION"))
+        return self.repository.update_execution_intent(intent)
+
     async def execute(self, execution_id: str, username: str) -> dict[str, Any]:
         intent = self._owned(execution_id, username)
         if intent["status"] in self.TERMINAL_STATUSES:
@@ -414,7 +441,13 @@ class JiraControlledBatchService:
         intent["started_at"] = _iso(now)
         intent["updated_at"] = _iso(now)
         intent["audit"].append(self._audit("BATCH_RUNNING", username, now, "SEQUENTIAL_BATCH_STARTED"))
-        self.repository.update_execution_intent(intent)
+        if not self.repository.transition_execution_intent(intent, "BATCH_CONFIRMED"):
+            current = self._owned(execution_id, username)
+            if current["status"] in self.TERMINAL_STATUSES:
+                return {**current, "reused": True}
+            raise Objective4C1Error(
+                "El lote ya fue reclamado. No se reenviara automaticamente."
+            )
 
         resolved_keys = copy.deepcopy(intent.get("known_parent_issue_keys") or {})
         for index, item in enumerate(items):
@@ -445,13 +478,14 @@ class JiraControlledBatchService:
                 sprint_field_id = (item.get("sprint_resolution") or {}).get("field_id")
                 if sprint_field_id:
                     readback_fields.append(str(sprint_field_id))
-                result = await self.gateway.create_single_task_and_readback(
+                result = await self.create_core.create_and_verify(
                     username,
                     create_arguments,
                     readback_fields,
                     int(self.policy.document["execution_timeout_seconds"]),
+                    sprint_resolution=item.get("sprint_resolution"),
                 )
-            except Exception as exc:
+            except Exception as exc:  # noqa: BLE001 - detiene el lote sin retry automático
                 uncertain = bool(getattr(exc, "outcome_uncertain", False))
                 item["status"] = "UNKNOWN" if uncertain else "REJECTED"
                 item["result"] = "OUTCOME_UNKNOWN" if uncertain else "JIRA_REJECTED"
@@ -462,13 +496,8 @@ class JiraControlledBatchService:
                 return self.repository.update_execution_intent(intent)
 
             issue_key = result.get("issue_key")
-            checks = JiraControlledExecutionService._readback_checks(
-                result.get("readback"),
-                issue_key,
-                create_arguments,
-                item.get("sprint_resolution"),
-            )
-            verified = bool(issue_key) and all(checks.values())
+            checks = result["checks"]
+            verified = bool(result["verified"])
             item["status"] = "CREATED_VERIFIED" if verified else "CREATED_UNVERIFIED"
             item["issue_key"] = issue_key
             item["issue_url"] = f"https://dpti.atlassian.net/browse/{issue_key}" if issue_key else None
@@ -476,6 +505,8 @@ class JiraControlledBatchService:
             item["completed_at"] = _iso(self.now())
             item["result"] = "CREATED_AND_VERIFIED" if verified else "CREATED_READBACK_INCOMPLETE"
             item["readback"] = {"checks": checks, "payload": result.get("readback")}
+            item["create_elapsed_ms"] = result.get("create_elapsed_ms")
+            item["readback_elapsed_ms"] = result.get("readback_elapsed_ms")
             if not verified:
                 self._stop(intent, index, "STOPPED_UNVERIFIED", username)
                 return self.repository.update_execution_intent(intent)
@@ -564,7 +595,9 @@ class JiraControlledBatchService:
             "automatic_retries": 0,
         }
 
-    async def _revalidate_all_sprints(self, intent: dict[str, Any], username: str) -> None:
+    async def _revalidate_all_sprints(
+        self, intent: dict[str, Any], username: str, *, audit_event: str = "BATCH_CONFIRMED"
+    ) -> None:
         sprint_items = [item for item in intent["items"] if ((item.get("sprint_resolution") or {}).get("selected") or {}).get("id")]
         if not sprint_items:
             return
@@ -584,7 +617,7 @@ class JiraControlledBatchService:
             item["sprint_resolution"]["selected"] = current
             item["sprint_revalidated_at"] = _iso(self.now())
         intent["updated_at"] = _iso(self.now())
-        intent["audit"].append(self._audit("BATCH_CONFIRMED", username, self.now(), "ALL_SPRINTS_REVALIDATED"))
+        intent["audit"].append(self._audit(audit_event, username, self.now(), "ALL_SPRINTS_REVALIDATED"))
         self.repository.update_execution_intent(intent)
 
     def _current_documents(
@@ -613,7 +646,7 @@ class JiraControlledBatchService:
 
     def _assert_not_expired(self, intent: dict[str, Any]) -> None:
         if self.now() > _parse_iso(intent["confirmation"]["expires_at"]):
-            raise Objective4C1Error("La confirmacion caduco; prepara nuevamente el lote.")
+            raise Objective4C1Error("La verificación de seguridad venció. Tus actividades siguen guardadas y no se creó nada en Jira; verifica nuevamente.")
 
     def _stop(self, intent: dict[str, Any], failed_index: int, status: str, username: str) -> None:
         for item in intent["items"][failed_index + 1:]:

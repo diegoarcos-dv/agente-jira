@@ -4,7 +4,7 @@
   "template_version": "1.1",
   "status": "FROZEN",
   "frozen_at": "2026-07-16",
-  "sha256": "9a4b913d55a27afdbee04efbc011ed134b394190eeaf968e94b2150b010f4204",
+  "sha256": "b7acbbfa54a412688d73ebcc2eb9e87447c35bb1dc247cf8e11c47efb5e69dda",
   "contract": {
     "capture_sheet": "PLAN_DE_TRABAJO",
     "header_row": 5,

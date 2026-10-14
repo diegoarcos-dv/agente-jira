@@ -20,7 +20,7 @@ No se habilitan `Epic`, `Subtask`, ASIT, MTTI, comentarios, transiciones, edici�
 - propuesta aprobada y Dry run vigente;
 - cero bloqueos antes de preparar;
 - responsable Jira exacto;
-- confirmación escrita `CREAR N ACTIVIDADES EN AT`;
+- confirmación escrita con la frase dinámica mostrada por la aplicación;
 - revalidación de Sprint antes de la primera creación;
 - ejecución secuencial;
 - `createJiraIssue` seguido de `getJiraIssue` por actividad;

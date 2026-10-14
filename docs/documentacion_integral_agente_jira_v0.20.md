@@ -1,5 +1,7 @@
 # Agente Jira — documentación integral del proyecto
 
+> **Documento histórico:** este corte conserva decisiones y ejemplos de Gates anteriores. La fuente operativa actual es el README raíz y los documentos `docs/gate_*.md`; la plantilla vigente es v1.2 y la confirmación se presenta dinámicamente en la interfaz. Las frases de confirmación y referencias v1.1 de este archivo no describen un comando fijo vigente.
+
 | Dato | Valor |
 |---|---|
 | Versión documental | 0.20 |

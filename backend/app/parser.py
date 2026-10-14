@@ -26,6 +26,19 @@ EXPECTED_HEADERS = (
     "Estado_Actual",
     "Comentarios",
 )
+EXPECTED_HEADERS_V12 = (
+    "Actividad *",
+    "Responsable *",
+    "Tipo_de_seguimiento *",
+    "Fecha_Objetivo",
+    "Proyecto_o_Frente",
+    "Contexto_o_Resultado",
+    "Comentarios",
+)
+EXPECTED_HEADERS_V13 = (
+    "Actividad *", "Área_Responsable", "Responsable *", "Tipo_de_seguimiento *",
+    "Fecha_Objetivo", "Proyecto_o_Frente", "Contexto_o_Resultado", "Comentarios",
+)
 ALLOWED_STATES = {
     "Pendiente",
     "En curso",
@@ -56,6 +69,7 @@ STATE_ALIASES = {
 class ParsedPlan:
     filename: str
     sha256: str
+    template_version: str
     rows: list[dict[str, Any]]
 
 
@@ -136,9 +150,15 @@ class TemplateParser:
             )
 
         sheet = workbook[CAPTURE_SHEET]
-        actual_headers = tuple(clean_text(sheet.cell(HEADER_ROW, col).value) for col in range(1, 8))
-        if actual_headers != EXPECTED_HEADERS:
-            for index, (expected, actual) in enumerate(zip(EXPECTED_HEADERS, actual_headers), 1):
+        version_text = clean_text(sheet["A3"].value) or ""
+        version = next((candidate for candidate in ("1.3", "1.2", "1.1")
+                        if f"v{candidate}" in version_text.casefold()), "1.1")
+        expected_headers = {"1.1": EXPECTED_HEADERS, "1.2": EXPECTED_HEADERS_V12,
+                            "1.3": EXPECTED_HEADERS_V13}[version]
+        actual_headers = tuple(clean_text(sheet.cell(HEADER_ROW, col).value)
+                               for col in range(1, len(expected_headers) + 1))
+        if actual_headers != expected_headers:
+            for index, (expected, actual) in enumerate(zip(expected_headers, actual_headers), 1):
                 if actual != expected:
                     issues.append(
                         ValidationIssue(
@@ -149,18 +169,17 @@ class TemplateParser:
                         )
                     )
             raise WorkbookValidationError(
-                "Los encabezados no corresponden a la Plantilla Excel v1.1.",
+                f"Los encabezados no corresponden a la Plantilla Excel v{version}.",
                 issues,
             )
 
-        version_text = clean_text(sheet["A3"].value) or ""
-        if "v1.1" not in version_text.casefold():
+        if not any(f"v{candidate}" in version_text.casefold() for candidate in ("1.1", "1.2", "1.3")):
             raise WorkbookValidationError(
-                "No se pudo confirmar la versión 1.1 de la plantilla.",
+                        "No se pudo confirmar la versión 1.1, 1.2 o 1.3 de la plantilla.",
                 [
                     ValidationIssue(
                         "INVALID_TEMPLATE_VERSION",
-                        "La celda A3 debe identificar la plantilla como v1.1.",
+                        "La celda A3 debe identificar la plantilla como v1.1, v1.2 o v1.3.",
                         row=3,
                         column="A",
                     )
@@ -169,77 +188,59 @@ class TemplateParser:
 
         rows: list[dict[str, Any]] = []
         for row_number in range(FIRST_DATA_ROW, LAST_DATA_ROW + 1):
-            values = [sheet.cell(row_number, col).value for col in range(1, 8)]
+            values = [sheet.cell(row_number, col).value for col in range(1, len(expected_headers) + 1)]
             activity = clean_text(values[0])
-            responsible = clean_text(values[1])
-            optional_values = [
-                clean_text(values[2]),
-                clean_text(values[3]),
-                values[4],
-                clean_text(values[6]),
-            ]
-            state = normalize_state(values[5])
-            is_empty_reserved_row = (
-                not activity
-                and not responsible
-                and not any(optional_values)
-                and state == "Pendiente"
-            )
-            if is_empty_reserved_row:
+            area_responsable = None
+            if version == "1.3":
+                area_responsable, responsible, tracking_type = clean_text(values[1]), clean_text(values[2]), clean_text(values[3])
+                normalized_date = normalize_date(values[4], workbook.epoch)
+                project_or_front, context, comments = clean_text(values[5]), clean_text(values[6]), clean_text(values[7])
+                state = "Pendiente"
+                optional_values = [area_responsable, tracking_type, values[4], project_or_front, context, comments]
+            elif version == "1.2":
+                responsible, tracking_type = clean_text(values[1]), clean_text(values[2])
+                normalized_date = normalize_date(values[3], workbook.epoch)
+                project_or_front, context, comments = clean_text(values[4]), clean_text(values[5]), clean_text(values[6])
+                state = "Pendiente"
+                optional_values = [tracking_type, values[3], project_or_front, context, comments]
+            else:
+                responsible = clean_text(values[1])
+                tracking_type = None
+                normalized_date = normalize_date(values[4], workbook.epoch)
+                project_or_front, context, comments = clean_text(values[2]), clean_text(values[3]), clean_text(values[6])
+                state = normalize_state(values[5])
+                optional_values = [project_or_front, context, values[4], comments]
+            if not activity and not responsible and not any(optional_values) and state == "Pendiente":
                 continue
-
             if not activity:
-                issues.append(
-                    ValidationIssue(
-                        "MISSING_ACTIVITY",
-                        "La actividad es obligatoria.",
-                        row=row_number,
-                        column="A",
-                    )
-                )
+                issues.append(ValidationIssue("MISSING_ACTIVITY", "La actividad es obligatoria.", row=row_number, column="A"))
             if not responsible:
-                issues.append(
-                    ValidationIssue(
-                        "MISSING_ASSIGNEE",
-                        "El responsable principal es obligatorio.",
-                        row=row_number,
-                        column="B",
-                    )
-                )
+                issues.append(ValidationIssue("MISSING_ASSIGNEE", "El responsable principal es obligatorio.", row=row_number,
+                                              column="C" if version == "1.3" else "B"))
+            if version in {"1.2", "1.3"} and not tracking_type:
+                issues.append(ValidationIssue("MISSING_TRACKING_TYPE", "El tipo de seguimiento es obligatorio.", row=row_number,
+                                              column="D" if version == "1.3" else "C"))
             if state not in ALLOWED_STATES:
-                issues.append(
-                    ValidationIssue(
-                        "INVALID_STATE",
-                        f"El estado '{state}' no pertenece al catálogo v1.1.",
-                        row=row_number,
-                        column="F",
-                    )
-                )
-
-            normalized_date = normalize_date(values[4], workbook.epoch)
-            if values[4] not in (None, "") and normalized_date is None:
-                issues.append(
-                    ValidationIssue(
-                        "INVALID_DATE",
-                        "La fecha debe ser una fecha Excel o usar el formato AAAA-MM-DD.",
-                        row=row_number,
-                        column="E",
-                    )
-                )
-
-            if activity and responsible and state in ALLOWED_STATES:
-                rows.append(
-                    {
-                        "source_row": row_number,
-                        "actividad": activity,
-                        "responsable_display": responsible,
-                        "frente_trabajo_origen": clean_text(values[2]),
-                        "contexto_resultado": clean_text(values[3]),
-                        "fecha_objetivo": normalized_date,
-                        "estado_actual": state,
-                        "comentarios": clean_text(values[6]),
-                    }
-                )
+                issues.append(ValidationIssue("INVALID_STATE", f"El estado '{state}' no pertenece al catálogo v1.1.",
+                                              row=row_number, column="F"))
+            date_index = 4 if version == "1.3" else 3 if version == "1.2" else 4
+            date_value = values[date_index]
+            if date_value not in (None, "") and normalized_date is None:
+                issues.append(ValidationIssue("INVALID_DATE", "La fecha debe ser una fecha Excel o usar el formato AAAA-MM-DD.",
+                                              row=row_number, column="E" if version == "1.3" else "D" if version == "1.2" else "E"))
+            if activity and responsible and state in ALLOWED_STATES and (version == "1.1" or tracking_type):
+                parsed_row = {
+                    "source_row": row_number, "actividad": activity, "responsable_display": responsible,
+                    "frente_trabajo_origen": project_or_front, "contexto_resultado": context,
+                    "fecha_objetivo": normalized_date, "estado_actual": state, "comentarios": comments,
+                    "tipo_seguimiento_origen": tracking_type,
+                }
+                if version == "1.3":
+                    parsed_row.update({"area_responsable": area_responsable, "area_source": "LOCAL",
+                                       "area_status": "EXPLICIT" if area_responsable else "UNSPECIFIED",
+                                       "area_candidates": [area_responsable] if area_responsable else [],
+                                       "area_mentions": []})
+                rows.append(parsed_row)
 
         if issues:
             raise WorkbookValidationError(
@@ -259,6 +260,6 @@ class TemplateParser:
         return ParsedPlan(
             filename=filename,
             sha256=hashlib.sha256(content).hexdigest(),
+            template_version=version,
             rows=rows,
         )
-

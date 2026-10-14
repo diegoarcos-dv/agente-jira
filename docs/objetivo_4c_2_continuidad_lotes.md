@@ -10,7 +10,7 @@ Permitir que un plan con más de cinco Tasks avance mediante lotes sucesivos, si
 ## Reglas
 
 - Cada lote conserva el máximo de cinco Tasks `AT / Task`.
-- Cada lote requiere su propia vista previa y frase `CREAR N TASKS EN AT`.
+- Cada lote requiere su propia vista previa y frase de confirmación dinámica.
 - Cada Task mantiene creación y lectura posterior; no se elimina la verificación para ahorrar créditos.
 - El avance entre lotes se calcula exclusivamente con SQLite y la evidencia ya persistida: cero llamadas MCP adicionales.
 - Una Task `CREATED_VERIFIED`, `CREATED_UNVERIFIED`, `REJECTED`, `UNKNOWN`, `PENDING` o `SUBMITTED` no vuelve a ofrecerse en la misma versión.

@@ -25,7 +25,7 @@ En “Origen y propuesta”, guarda cada relación con `Guardar y volver a valid
 1. Selecciona las cuatro actividades. La interfaz puede agregar automáticamente al padre cuando eliges al hijo.
 2. Pulsa `Preparar lote`.
 3. Verifica que cada padre aparezca antes que su hijo.
-4. Escribe la frase exacta `CREAR 4 ACTIVIDADES EN AT`.
+4. Copia la frase de confirmación que muestra la aplicación para el lote actual.
 5. Confirma y pulsa la creación real.
 
 Resultado esperado:

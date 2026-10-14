@@ -147,6 +147,52 @@ class JiraExecutionPolicy:
         )
         return [code for condition, code in checks if not condition]
 
+    def direct_create_gate_violations(
+        self,
+        *,
+        space: str,
+        work_type: str,
+        tool_name: str,
+        exact_active_account: bool,
+        assignee_in_atomic_create: bool,
+        second_confirmation: bool,
+    ) -> list[str]:
+        """Evaluate one locally prepared create without allowing voice to alter policy."""
+
+        checks = (
+            (
+                self.mode
+                in {
+                    "SINGLE_CANARY",
+                    "CONTROLLED_BATCH",
+                    "CONTROLLED_MULTI_TYPE_BATCH",
+                    "CONTROLLED_HIERARCHY_BATCH",
+                },
+                "POLICY_MODE_BLOCKED",
+            ),
+            (self.jira_write_enabled, "JIRA_WRITE_DISABLED"),
+            (space in self.document["allowed_spaces"], "SPACE_NOT_ALLOWED"),
+            (work_type in self.document["allowed_work_types"], "WORK_TYPE_NOT_ALLOWED"),
+            (1 <= int(self.document["max_items_per_execution"]), "EXECUTION_ITEM_LIMIT_EXCEEDED"),
+            (tool_name == self.required_write_tool, "WRITE_TOOL_NOT_ALLOWED"),
+            (
+                exact_active_account or not self.document["require_exact_active_account"],
+                "ATLASSIAN_ACCOUNT_NOT_CONFIRMED",
+            ),
+            (
+                assignee_in_atomic_create
+                or not self.document["require_assignee_in_atomic_create"],
+                "ASSIGNEE_NOT_IN_ATOMIC_CREATE",
+            ),
+            (
+                second_confirmation or not self.document["require_second_confirmation"],
+                "SECOND_CONFIRMATION_REQUIRED",
+            ),
+            (not self.document["automatic_retry"], "AUTOMATIC_RETRY_MUST_REMAIN_DISABLED"),
+            (self.document["allowed_environment"] == "local", "ENVIRONMENT_NOT_ALLOWED"),
+        )
+        return [code for condition, code in checks if not condition]
+
 
 def load_execution_policy(policy_path: Path, schema_path: Path) -> JiraExecutionPolicy:
     try:

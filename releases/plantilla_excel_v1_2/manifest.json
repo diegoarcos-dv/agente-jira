@@ -1,0 +1,53 @@
+{
+  "version": "1.2",
+  "sheet": "PLAN_DE_TRABAJO",
+  "headers": [
+    "Actividad *",
+    "Responsable *",
+    "Tipo_de_seguimiento *",
+    "Fecha_Objetivo",
+    "Proyecto_o_Frente",
+    "Contexto_o_Resultado",
+    "Comentarios"
+  ],
+  "catalog": {
+    "space": "AT",
+    "work_type": "Task",
+    "field_id": "customfield_10147",
+    "field_name": "Tipo de seguimiento",
+    "options": [
+      {
+        "value": "Proyecto estándar",
+        "label": "Proyecto estándar",
+        "jira_id": "10059"
+      },
+      {
+        "value": "Actividad concreta",
+        "label": "Actividad concreta",
+        "jira_id": "10060"
+      },
+      {
+        "value": "Soporte",
+        "label": "Soporte",
+        "jira_id": "10061"
+      },
+      {
+        "value": "Tarea extraordinaria",
+        "label": "Tarea extraordinaria",
+        "jira_id": "10062"
+      },
+      {
+        "value": "Documentación",
+        "label": "Documentación",
+        "jira_id": "10063"
+      },
+      {
+        "value": "Evaluación",
+        "label": "Evaluación",
+        "jira_id": "10064"
+      }
+    ],
+    "fetched_at": "2026-09-03T18:40:17.466168Z",
+    "status": "verified"
+  }
+}

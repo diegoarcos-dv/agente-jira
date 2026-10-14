@@ -3,6 +3,8 @@ from __future__ import annotations
 import hashlib
 import json
 import unicodedata
+import asyncio
+from time import perf_counter
 from datetime import UTC, datetime
 from typing import Any, Protocol
 
@@ -10,6 +12,7 @@ from .errors import ProposalStateError
 from .hierarchy import JiraHierarchyError, validate_parent_relation
 from .repository import ProposalRepository
 from .sprints import resolve_sprint
+from .performance import current_trace
 
 
 class JiraReadGateway(Protocol):
@@ -86,9 +89,12 @@ class JiraDryRunService:
         self,
         repository: ProposalRepository,
         jira: JiraReadGateway,
+        *,
+        read_concurrency: int = 4,
     ):
         self.repository = repository
         self.jira = jira
+        self.read_concurrency = max(1, min(8, int(read_concurrency)))
 
     async def generate(
         self,
@@ -100,7 +106,16 @@ class JiraDryRunService:
                 "El Dry run sólo puede generarse para una propuesta aprobada y bloqueada."
             )
 
+        trace = current_trace()
+        if trace is not None:
+            trace.proposal_id = str(proposal.get("proposal_id"))
+            trace.activity_count = len(proposal.get("items", []))
+        started_total = perf_counter()
+        snapshot_started = perf_counter()
         snapshot = self.jira.connected_snapshot(username)
+        if trace is not None:
+            trace.record_cache_event("jira_snapshot", cache_status="HIT", phase="snapshot_jira", proposal_id=str(proposal.get("proposal_id")))
+            trace.record_phase("snapshot_jira", (perf_counter() - snapshot_started) * 1000)
         proposal_hash = _canonical_hash(proposal)
         spaces = {space["key"]: space for space in snapshot.get("spaces", [])}
         rows = {
@@ -108,8 +123,18 @@ class JiraDryRunService:
             for item in proposal["items"]
         }
         assignee_cache: dict[tuple[str, str], list[dict[str, Any]]] = {}
+        assignee_cache_errors: dict[tuple[str, str], str] = {}
         sprint_cache: dict[str, list[dict[str, Any]]] = {}
         sprint_cache_errors: dict[str, str] = {}
+        await self._prefetch_reads(
+            proposal,
+            username,
+            spaces,
+            assignee_cache,
+            assignee_cache_errors,
+            sprint_cache,
+            sprint_cache_errors,
+        )
         items: list[dict[str, Any]] = []
 
         for item in proposal["items"]:
@@ -143,6 +168,7 @@ class JiraDryRunService:
             errors: list[dict[str, str]] = []
             warnings: list[dict[str, str]] = []
             space_key = generated["space"]
+            work_type_started = perf_counter()
             space = spaces.get(space_key)
             if space is None or not space.get("found"):
                 errors.append(self._issue("SPACE_NOT_VISIBLE", "space", f"El Space {space_key} no está visible en Jira."))
@@ -174,25 +200,37 @@ class JiraDryRunService:
                         f"Jira no devolvió metadatos de campos para {work_type.get('name')} en {space_key}.",
                     )
                 )
+            if trace is not None:
+                trace.record_phase("work_type_fields", (perf_counter() - work_type_started) * 1000)
 
             if not str(generated.get("title") or "").strip():
                 errors.append(self._issue("TITLE_REQUIRED", "title", "El título está vacío."))
             if not str(generated.get("description") or "").strip():
                 errors.append(self._issue("DESCRIPTION_REQUIRED", "description", "La descripción está vacía."))
             if not str(generated.get("fields", {}).get("tipo_seguimiento") or "").strip():
-                errors.append(
-                    self._issue(
-                        "TRACKING_TYPE_REQUIRED",
-                        "tipo_seguimiento",
-                        "La normativa requiere Tipo de seguimiento antes de enviar a Jira.",
-                    )
+                issue = self._issue(
+                    "TRACKING_TYPE_REQUIRED",
+                    "tipo_seguimiento",
+                    "La normativa requiere Tipo de seguimiento antes de enviar a Jira.",
                 )
+                tracking_field = next(
+                    (field for field in fields if _field_kind(field) == "tipo_seguimiento"), None
+                )
+                if tracking_field and isinstance(tracking_field.get("options"), list):
+                    issue["options"] = [
+                        {"value": option.get("value") or option.get("label"), "jira_id": option.get("jira_id")}
+                        for option in tracking_field["options"]
+                        if isinstance(option, dict) and (option.get("value") or option.get("label"))
+                    ]
+                errors.append(issue)
 
             assignee_result = await self._resolve_assignee(
                 username,
                 space_key,
                 generated.get("assignee") or {},
                 assignee_cache,
+                assignee_cache_errors=assignee_cache_errors,
+                row_id=row_id,
             )
             errors.extend(assignee_result["errors"])
             warnings.extend(assignee_result["warnings"])
@@ -292,6 +330,8 @@ class JiraDryRunService:
                         except Exception as exc:
                             sprint_cache_errors[space_key] = str(exc)[:240]
                             sprint_cache[space_key] = []
+                    elif trace is not None:
+                        trace.record_cache_event("list_sprints", cache_status="HIT", phase="catalog_sprint", proposal_id=str(proposal.get("proposal_id")), row_id=row_id)
                     if space_key in sprint_cache_errors:
                         errors.append(
                             self._issue(
@@ -309,6 +349,7 @@ class JiraDryRunService:
                             warnings.append(sprint_resolution["warning"])
                         selected_sprint = sprint_resolution.get("selected")
                         values["sprint"] = selected_sprint.get("id") if selected_sprint else None
+            field_validation_started = perf_counter()
             for field in fields:
                 kind = _field_kind(field)
                 selected_value = values.get(kind) if kind else None
@@ -323,13 +364,19 @@ class JiraDryRunService:
                     if isinstance(option, dict)
                 }
                 if _normalize(selected_value) not in allowed:
-                    errors.append(
-                        self._issue(
-                            "FIELD_VALUE_NOT_ALLOWED",
-                            kind,
-                            f"El valor '{selected_value}' ya no aparece entre las opciones vigentes de '{field.get('name') or kind}' en Jira.",
-                        )
+                    issue = self._issue(
+                        "FIELD_VALUE_NOT_ALLOWED",
+                        kind,
+                        f"El valor '{selected_value}' ya no aparece entre las opciones vigentes de '{field.get('name') or kind}' en Jira.",
                     )
+                    option_details = [
+                        {"value": option.get("value") or option.get("label"), "jira_id": option.get("jira_id")}
+                        for option in options
+                        if isinstance(option, dict) and (option.get("value") or option.get("label"))
+                    ]
+                    if any(option.get("jira_id") for option in option_details):
+                        issue["options"] = option_details
+                    errors.append(issue)
             for field in fields:
                 if not field.get("required"):
                     continue
@@ -350,6 +397,9 @@ class JiraDryRunService:
                             f"Falta un valor para el campo obligatorio '{field.get('name') or kind}'.",
                         )
                     )
+
+            if trace is not None:
+                trace.record_phase("tracking_global_fields", (perf_counter() - field_validation_started) * 1000)
 
             mapped_fields = {
                 str(field.get("id")): values.get(kind)
@@ -449,6 +499,8 @@ class JiraDryRunService:
             "write_performed": False,
         }
         stored, reused = self.repository.save_dry_run(document)
+        if trace is not None:
+            trace.record_phase("dry_run", (perf_counter() - started_total) * 1000)
         return {**stored, "reused": reused}
 
     async def _resolve_assignee(
@@ -457,6 +509,9 @@ class JiraDryRunService:
         space: str,
         requested: dict[str, Any],
         cache: dict[tuple[str, str], list[dict[str, Any]]],
+        *,
+        assignee_cache_errors: dict[tuple[str, str], str] | None = None,
+        row_id: str | None = None,
     ) -> dict[str, Any]:
         display_name = str(requested.get("display_name") or "").strip()
         email = str(requested.get("email") or "").strip()
@@ -470,6 +525,23 @@ class JiraDryRunService:
         key = (space, _normalize(query))
         if key not in cache:
             cache[key] = await self.jira.find_assignees(username, space, query)
+        else:
+            trace = current_trace()
+            if trace is not None:
+                trace.record_cache_event("find_assignees", cache_status="HIT", phase="assignee_resolution", row_id=row_id)
+        if assignee_cache_errors and key in assignee_cache_errors:
+            return {
+                "assignee": None,
+                "errors": [
+                    self._issue(
+                        "ASSIGNEE_LOOKUP_UNAVAILABLE",
+                        "assignee",
+                        "No fue posible consultar responsables en Jira: "
+                        + assignee_cache_errors[key],
+                    )
+                ],
+                "warnings": [],
+            }
         candidates = cache[key]
         exact = [
             candidate
@@ -522,6 +594,88 @@ class JiraDryRunService:
             "warnings": [],
         }
 
+    async def _prefetch_reads(
+        self,
+        proposal: dict[str, Any],
+        username: str,
+        spaces: dict[str, dict[str, Any]],
+        assignee_cache: dict[tuple[str, str], list[dict[str, Any]]],
+        assignee_cache_errors: dict[tuple[str, str], str],
+        sprint_cache: dict[str, list[dict[str, Any]]],
+        sprint_cache_errors: dict[str, str],
+    ) -> None:
+        """Resolve independent read-only catalogs once, with bounded concurrency.
+
+        This is deliberately request-scoped. It never caches credentials, write
+        authorization, preflight results, or idempotency decisions across requests.
+        """
+        trace = current_trace()
+        started = perf_counter()
+        assignee_queries: dict[tuple[str, str], tuple[str, str]] = {}
+        sprint_spaces: set[str] = set()
+        list_sprints = getattr(self.jira, "list_sprints", None)
+        for item in proposal.get("items", []):
+            generated = item.get("generated") or {}
+            if generated.get("decision") == "EXCLUIR":
+                continue
+            space_key = str(generated.get("space") or "")
+            requested = generated.get("assignee") or {}
+            display_name = str(requested.get("display_name") or "").strip()
+            email = str(requested.get("email") or "").strip()
+            query = email if email and not email.lower().endswith("@example.com") else display_name
+            if query:
+                assignee_queries.setdefault(
+                    (space_key, _normalize(query)),
+                    (space_key, query),
+                )
+            space = spaces.get(space_key)
+            work_type = next(
+                (
+                    candidate
+                    for candidate in (space or {}).get("work_types", [])
+                    if _work_type_matches(generated.get("work_type", ""), candidate.get("name"))
+                ),
+                None,
+            )
+            if list_sprints is not None and any(
+                _field_kind(field) == "sprint" for field in (work_type or {}).get("fields", [])
+            ):
+                sprint_spaces.add(space_key)
+
+        semaphore = asyncio.Semaphore(self.read_concurrency)
+
+        async def fetch_assignee(key: tuple[str, str], request: tuple[str, str]) -> None:
+            space_key, query = request
+            async with semaphore:
+                try:
+                    assignee_cache[key] = await self.jira.find_assignees(username, space_key, query)
+                except Exception as exc:
+                    assignee_cache_errors[key] = str(exc)[:240]
+                    assignee_cache[key] = []
+
+        async def fetch_sprints(space_key: str) -> None:
+            async with semaphore:
+                try:
+                    sprint_cache[space_key] = await list_sprints(
+                        username,
+                        space_key,
+                        force_refresh=True,
+                    )
+                except Exception as exc:
+                    sprint_cache_errors[space_key] = str(exc)[:240]
+                    sprint_cache[space_key] = []
+
+        tasks = [
+            fetch_assignee(key, request)
+            for key, request in assignee_queries.items()
+        ]
+        if list_sprints is not None:
+            tasks.extend(fetch_sprints(space_key) for space_key in sorted(sprint_spaces))
+        if tasks:
+            await asyncio.gather(*tasks)
+        if trace is not None:
+            trace.record_phase("read_prefetch", (perf_counter() - started) * 1000)
+
     @staticmethod
-    def _issue(code: str, field: str, message: str) -> dict[str, str]:
+    def _issue(code: str, field: str, message: str) -> dict[str, Any]:
         return {"code": code, "field": field, "message": message}

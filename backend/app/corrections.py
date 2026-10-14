@@ -12,6 +12,7 @@ USER_ACTION_CODES = {
     "TITLE_REQUIRED",
     "DESCRIPTION_REQUIRED",
     "WORK_TYPE_NOT_AVAILABLE",
+    "FIELD_VALUE_NOT_ALLOWED",
 }
 
 
@@ -25,6 +26,8 @@ def _user_instruction(issue: dict[str, Any]) -> str:
         return "Completa o corrige la descripción de la actividad."
     if field == "work_type":
         return "Selecciona un Work Type disponible en el Space."
+    if field == "tipo_seguimiento":
+        return "El tipo de seguimiento actual ya no está disponible. Selecciona uno vigente de Jira."
     return "Corrige el dato indicado y guarda la actividad."
 
 
@@ -49,13 +52,20 @@ def _was_corrected(
         current = generated.get("assignee") or {}
         current_account = current.get("account_id")
         old_account = historical.get("assignee_account_id")
-        verified_by_rovo = str(review.get("review_note") or "").startswith(
-            "Responsable verificado contra Jira"
-        )
+        # The authoritative signal is the persisted, resolved Jira account.
+        # Do not depend on an optional human note: manual Jira selection stores
+        # the verified account in generated.assignee and the old dry-run keeps
+        # the previous account in its immutable logical payload.
+        verified_by_jira = (
+            current.get("resolution") == "RESOLVED"
+            and not str(current.get("account_id") or "").startswith("local-account-")
+        ) or str(
+            review.get("review_note") or ""
+        ).startswith("Responsable verificado contra Jira")
         return bool(
             current_account
             and current_account != old_account
-            and verified_by_rovo
+            and verified_by_jira
         )
     if field == "title":
         return bool(str(generated.get("title") or "").strip()) and (
@@ -120,7 +130,9 @@ def build_correction_workflow(
                     "La corrección fue guardada y se comprobará en la "
                     "prevalidación final."
                 )
-                visible_issues = user_issues
+                # Issues from the historical dry-run are evidence only; never
+                # expose them as active blockers for the current version.
+                visible_issues = []
 
             items.append(
                 {

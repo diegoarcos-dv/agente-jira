@@ -6,10 +6,10 @@ import hashlib
 import json
 import logging
 import re
-import secrets
 import unicodedata
 from dataclasses import dataclass, field
-from datetime import datetime, timedelta, timezone
+from datetime import UTC, datetime, timedelta
+from time import perf_counter
 from typing import Any, Protocol
 from urllib.parse import parse_qs, urlparse
 
@@ -24,13 +24,19 @@ from mcp.shared.auth import (
 )
 
 from .config import Settings
+from .connection_diagnostics import ConnectionDiagnostics, ConnectionFailure, failure_report
 from .oauth_storage import EncryptedFileOAuthStorage, WindowsDpapiProtector
-
+from .jira_write_lock import GlobalJiraWriteLock, GlobalJiraWriteLockError
+from .performance import current_trace
 
 logger = logging.getLogger(__name__)
 
 TARGET_SPACES = ("AT", "ASIT", "MTTI")
 VISIBLE_PROJECTS_MAX_RESULTS = 50
+FIELD_METADATA_MAX_RESULTS = 50
+FIELD_METADATA_MAX_PAGES = 20
+OAUTH_CONSENT_TIMEOUT_SECONDS = 300
+ASSIGNEE_LOOKUP_CACHE_TTL_SECONDS = 45
 
 # This is the only tool surface the application is allowed to invoke in Objective 3A.
 # The guard is enforced before the MCP transport is reached and is covered by tests.
@@ -181,14 +187,21 @@ def _schema_arguments(
 ) -> dict[str, Any]:
     schema = getattr(tool, "inputSchema", None) or {}
     properties = schema.get("properties", {}) if isinstance(schema, dict) else {}
+    required = set(schema.get("required", ())) if isinstance(schema, dict) else set()
     arguments: dict[str, Any] = {}
+    consumed_canonical: set[str] = set()
     aliases = {
         "cloudId": ("cloudId", "cloud_id"),
-        "projectKey": ("projectKey", "projectIdOrKey", "projectId", "project"),
+        # Atlassian currently publishes both projectKey and projectIdOrKey for
+        # some read tools while server-side validation requires the latter.
+        # Write tools that only expose projectKey still map to projectKey.
+        "projectKey": ("projectIdOrKey", "projectKey", "projectId", "project"),
         "issueTypeId": ("issueTypeId", "issueType", "issuetypeId"),
         "query": ("query", "searchString", "searchTerm", "text", "username"),
         "jql": ("jql",),
         "maxResults": ("maxResults", "limit"),
+        "startAt": ("startAt", "offset"),
+        "requiredFieldsOnly": ("requiredFieldsOnly",),
         "nextPageToken": ("nextPageToken", "pageToken"),
         "issueIdOrKey": ("issueIdOrKey", "issueKey", "issueId"),
         "fields": ("fields",),
@@ -198,15 +211,27 @@ def _schema_arguments(
     for canonical, candidates in aliases.items():
         if canonical not in values:
             continue
-        for candidate in candidates:
+        # Some Atlassian MCP schemas expose legacy and current aliases at the
+        # same time, but require only one of them. Prefer the required alias so
+        # the payload follows the contract actually validated by the server.
+        ordered_candidates = (*[item for item in candidates if item in required],
+                              *[item for item in candidates if item not in required])
+        for candidate in ordered_candidates:
             if candidate in properties:
                 arguments[candidate] = values[canonical]
+                consumed_canonical.add(canonical)
                 break
+    # Callers may already have schema-native arguments (for example after a
+    # first mapping pass in the dashboard service). Keep those values instead
+    # of dropping them when this guard maps the request again.
+    for key, value in values.items():
+        if key in properties and key not in arguments and key not in consumed_canonical:
+            arguments[key] = value
     return arguments
 
 
 def _utc_now() -> str:
-    return datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
+    return datetime.now(UTC).isoformat().replace("+00:00", "Z")
 
 
 def _extract_issue_key(payload: Any) -> str | None:
@@ -310,6 +335,28 @@ def _normalize_identity(value: Any) -> str:
     return " ".join(text.casefold().split())
 
 
+def work_type_matches(requested: Any, candidate: dict[str, Any] | None) -> bool:
+    """Match Jira work types by semantic identity, including localized subtasks."""
+    if not isinstance(candidate, dict):
+        return False
+    requested_key = _normalize_identity(requested)
+    actual_key = _normalize_identity(candidate.get("name"))
+    if requested_key in {"subtask", "sub-task", "sub tarea", "subtarea"}:
+        return bool(candidate.get("subtask")) or actual_key in {
+            "subtask",
+            "sub-task",
+            "sub tarea",
+            "subtarea",
+        }
+    aliases = {
+        "task": {"task", "tarea"},
+        "story": {"story", "historia"},
+        "bug": {"bug", "defecto", "incidencia"},
+        "epic": {"epic"},
+    }
+    return actual_key in aliases.get(requested_key, {requested_key})
+
+
 BUSINESS_FIELD_ALIASES = {
     "iniciativa": {"iniciativa", "initiative"},
     "linea_trabajo": {"linea de trabajo", "linea trabajo", "workstream"},
@@ -377,27 +424,39 @@ class OAuthAttempt:
     provider: OAuthClientProvider | None = None
     available_tools: dict[str, Any] = field(default_factory=dict)
     assignee_allowed_accounts: dict[str, set[str]] = field(default_factory=dict)
+    assignee_lookup_cache: dict[str, tuple[datetime, list[dict[str, Any]]]] = field(default_factory=dict)
     snapshot: dict[str, Any] | None = None
     error: str | None = None
     connected: bool = False
     stage: str = "IDLE"
     sprint_cache: dict[str, tuple[datetime, list[dict[str, Any]]]] = field(default_factory=dict)
+    diagnostic_failure: dict[str, Any] | None = None
 
 
 class AtlassianIntegrationManager:
     """Per-user OAuth + read-only Rovo MCP integration for the local MVP."""
 
-    def __init__(self, settings: Settings):
+    def __init__(self, settings: Settings, write_lock: GlobalJiraWriteLock | None = None):
         self.settings = settings
+        self.write_lock = write_lock
         self._attempts: dict[str, OAuthAttempt] = {}
         self._states: dict[str, OAuthAttempt] = {}
         self._restore_locks: dict[str, asyncio.Lock] = {}
+        self._refresh_locks: dict[str, asyncio.Lock] = {}
+        self.diagnostics = ConnectionDiagnostics(self)
         try:
             self._protector = WindowsDpapiProtector()
             self._oauth_storage_kind = "OS_ENCRYPTED"
         except RuntimeError:
             self._protector = None
             self._oauth_storage_kind = "MEMORY_ONLY"
+
+    def new_atlassian_http_client(self, **kwargs: Any) -> httpx.AsyncClient:
+        """Create an Atlassian-only HTTP client, honoring an explicit corporate proxy."""
+
+        if self.settings.atlassian_proxy_url:
+            kwargs["proxy"] = self.settings.atlassian_proxy_url
+        return httpx.AsyncClient(**kwargs)
 
     def status(self, username: str) -> dict[str, Any]:
         attempt = self._attempts.get(username)
@@ -413,6 +472,7 @@ class AtlassianIntegrationManager:
             "error": None,
             "snapshot": None,
             "stage": "IDLE",
+            "diagnostic": self.diagnostics.status(username),
         }
         if attempt is None:
             return base
@@ -426,6 +486,8 @@ class AtlassianIntegrationManager:
             base["phase"] = "CONNECTING"
         base["snapshot"] = attempt.snapshot
         base["stage"] = attempt.stage
+        if base['diagnostic']['state'] not in ('JIRA_READY',):
+            base['connected'] = False
         return base
 
     def objective_4_tool_readiness(self, username: str) -> dict[str, Any]:
@@ -481,6 +543,8 @@ class AtlassianIntegrationManager:
         except TimeoutError as exc:
             if attempt.task.done():
                 await self._surface_task_failure(attempt)
+            attempt.task.cancel()
+            attempt.diagnostic_failure = failure_report(ConnectionFailure('MCP_TIMEOUT'), attempt.stage)
             raise AtlassianIntegrationError(
                 "Atlassian no entregó la URL de autorización dentro del tiempo esperado."
             ) from exc
@@ -491,15 +555,20 @@ class AtlassianIntegrationManager:
         return {"authorization_url": attempt.authorization_url, "phase": "AWAITING_USER_CONSENT"}
 
     async def finish_callback(self, code: str, state: str) -> dict[str, Any]:
-        attempt = self._states.get(state)
+        attempt = self._states.pop(state, None)
         if attempt is None:
-            raise AtlassianIntegrationError("El estado OAuth no existe o ya venció.")
+            raise AtlassianIntegrationError("OAUTH_STATE_INVALID")
+        if not code:
+            attempt.diagnostic_failure = failure_report(ConnectionFailure('OAUTH_CALLBACK_INVALID'), 'OAUTH_CALLBACK')
+            raise AtlassianIntegrationError('OAUTH_CALLBACK_INVALID')
         await attempt.callback_queue.put((code, state))
         if attempt.task is None:
             raise AtlassianIntegrationError("La autorización OAuth no tiene una tarea activa.")
         try:
             await asyncio.wait_for(asyncio.shield(attempt.task), timeout=90)
         except TimeoutError as exc:
+            attempt.diagnostic_failure = failure_report(ConnectionFailure('MCP_TIMEOUT'), attempt.stage)
+            attempt.task.cancel()
             raise AtlassianIntegrationError(
                 "Atlassian autorizó el acceso, pero la consulta MCP no terminó a tiempo."
             ) from exc
@@ -512,9 +581,17 @@ class AtlassianIntegrationManager:
             return
         attempt = self._states.pop(state, None)
         if attempt is not None:
-            await self.disconnect(attempt.username)
+            if attempt.task and not attempt.task.done():
+                attempt.task.cancel()
+                try:
+                    await attempt.task
+                except asyncio.CancelledError:
+                    pass
+            attempt.diagnostic_failure = failure_report(ConnectionFailure('OAUTH_CANCELLED'), 'OAUTH_CALLBACK')
+            attempt.error = 'La autorización de Atlassian fue cancelada.'
 
     async def disconnect(self, username: str) -> None:
+        self.diagnostics.results.pop(username, None)
         attempt = self._attempts.pop(username, None)
         if attempt is not None:
             if attempt.oauth_state:
@@ -525,9 +602,68 @@ class AtlassianIntegrationManager:
                     await attempt.task
                 except (asyncio.CancelledError, Exception):
                     pass
-            attempt.storage.clear()
-        else:
+            try:
+                attempt.storage.clear()
+            except RuntimeError:
+                # A DPAPI blob can become unreadable after a Windows/session change.
+                # An explicit reconnect must still be able to discard that stale
+                # credential before starting a fresh OAuth flow.
+                pass
+        try:
             self._storage(username).clear()
+        except RuntimeError:
+            # The persisted file itself cannot be decrypted, so clear only that
+            # user's unreadable OAuth blob as part of the explicit reconnect.
+            directory = (
+                self.settings.atlassian_oauth_storage_dir
+                or self.settings.database_path.parent / "atlassian_oauth"
+            )
+            EncryptedFileOAuthStorage.clear_persisted(directory, username)
+
+    async def rebind_user(self, source_username: str, destination_username: str) -> None:
+        """Attach a completed OAuth attempt to its authorized local user."""
+
+        if not source_username or not destination_username or source_username == destination_username:
+            return
+        attempt = self._attempts.pop(source_username, None)
+        if attempt is not None:
+            if attempt.oauth_state:
+                self._states[attempt.oauth_state] = attempt
+            attempt.username = destination_username
+            self._attempts[destination_username] = attempt
+        directory = (
+            self.settings.atlassian_oauth_storage_dir
+            or self.settings.database_path.parent / "atlassian_oauth"
+        )
+        if self._protector is not None:
+            EncryptedFileOAuthStorage.move_persisted(directory, source_username, destination_username)
+        if source_username in self._restore_locks:
+            self._restore_locks[destination_username] = self._restore_locks.pop(source_username)
+        if source_username in self._refresh_locks:
+            self._refresh_locks[destination_username] = self._refresh_locks.pop(source_username)
+
+    def credential_metadata(self, username: str) -> dict[str, Any]:
+        attempt = self._attempts.get(username)
+        token = attempt.storage.tokens if attempt else None
+        snapshot = attempt.snapshot if attempt else None
+        scopes = getattr(token, "scope", None) if token else None
+        return {
+            "expires_at": str(getattr(token, "expires_at", None) or "") or None,
+            "scopes": " ".join(scopes) if isinstance(scopes, (list, tuple, set)) else str(scopes or "") or None,
+            "cloud_id": (snapshot or {}).get("cloud_id"),
+            "site_url": (snapshot or {}).get("site_url"),
+        }
+
+    def has_persisted_credentials(self, username: str) -> bool:
+        """Check only for a user's encrypted credential file, never its contents."""
+
+        if self._protector is None:
+            return False
+        directory = (
+            self.settings.atlassian_oauth_storage_dir
+            or self.settings.database_path.parent / "atlassian_oauth"
+        )
+        return EncryptedFileOAuthStorage.path_for(directory, username).is_file()
 
     async def ensure_restored(self, username: str) -> dict[str, Any]:
         """Recover a previously authorized session without asking for consent again."""
@@ -538,7 +674,14 @@ class AtlassianIntegrationManager:
         async with lock:
             if username in self._attempts:
                 return self.status(username)
-            storage = self._storage(username)
+            try:
+                storage = self._storage(username)
+            except RuntimeError as exc:
+                attempt = OAuthAttempt(username=username)
+                attempt.error = 'La autorización Atlassian guardada no se puede recuperar.'
+                attempt.diagnostic_failure = failure_report(exc, 'RESTORE_SAVED_OAUTH')
+                self._attempts[username] = attempt
+                return self.status(username)
             if not storage.has_credentials:
                 return self.status(username)
             attempt = OAuthAttempt(username=username, storage=storage)
@@ -561,32 +704,38 @@ class AtlassianIntegrationManager:
             )
             attempt.stage = "RESTORE_SAVED_OAUTH"
             try:
-                attempt.snapshot = await self._discover(attempt)
+                attempt.snapshot = await asyncio.wait_for(self._discover(attempt), 90)
                 attempt.connected = True
                 attempt.stage = "COMPLETE"
             except Exception as exc:
-                attempt.error = self._safe_error(exc, attempt.stage)
+                attempt.diagnostic_failure = failure_report(exc, attempt.stage)
+                attempt.error = attempt.diagnostic_failure['message']
             return self.status(username)
 
     async def refresh(self, username: str) -> dict[str, Any]:
-        await self.ensure_restored(username)
-        attempt = self._attempts.get(username)
-        if (
-            attempt is None
-            or attempt.provider is None
-            or attempt.storage.tokens is None
-        ):
-            raise AtlassianIntegrationError("Primero conecta tu cuenta Atlassian.")
-        attempt.error = None
-        attempt.connected = False
-        try:
-            attempt.snapshot = await self._discover(attempt)
-            attempt.connected = True
-            attempt.stage = "COMPLETE"
-        except Exception as exc:
-            attempt.error = self._safe_error(exc, attempt.stage)
-            raise AtlassianIntegrationError(attempt.error) from exc
-        return self.status(username)
+        lock = self._refresh_locks.setdefault(username, asyncio.Lock())
+        async with lock:
+            await self.ensure_restored(username)
+            attempt = self._attempts.get(username)
+            if (
+                attempt is None
+                or attempt.provider is None
+                or attempt.storage.tokens is None
+            ):
+                raise AtlassianIntegrationError("Primero conecta tu cuenta Atlassian.")
+            attempt.error = None
+            attempt.diagnostic_failure = None
+            self.diagnostics.results.pop(username, None)
+            attempt.connected = False
+            try:
+                attempt.snapshot = await asyncio.wait_for(self._discover(attempt), 90)
+                attempt.connected = True
+                attempt.stage = "COMPLETE"
+            except Exception as exc:
+                attempt.diagnostic_failure = failure_report(exc, attempt.stage)
+                attempt.error = attempt.diagnostic_failure['message']
+                raise AtlassianIntegrationError(attempt.error) from exc
+            return self.status(username)
 
     async def find_assignees(
         self,
@@ -600,6 +749,11 @@ class AtlassianIntegrationManager:
         if len(query.strip()) < 2:
             raise AtlassianIntegrationError("Escribe al menos dos caracteres para buscar.")
         attempt = self._connected_attempt(username)
+        cache_key = f"{space}:{_normalize_identity(query)}"
+        cached = attempt.assignee_lookup_cache.get(cache_key)
+        now = datetime.now(UTC)
+        if cached and now - cached[0] < timedelta(seconds=ASSIGNEE_LOOKUP_CACHE_TTL_SECONDS):
+            return copy.deepcopy(cached[1])
         tool_name = next(
             (
                 name
@@ -652,7 +806,9 @@ class AtlassianIntegrationManager:
             if _normalize_identity(user.get("display_name")) == normalized_query
             or _normalize_identity(user.get("email")) == normalized_query
         ]
-        return exact or active_users
+        result = exact or active_users
+        attempt.assignee_lookup_cache[cache_key] = (now, copy.deepcopy(result))
+        return result
 
     async def list_sprints(
         self,
@@ -668,7 +824,7 @@ class AtlassianIntegrationManager:
             raise AtlassianIntegrationError("Space no permitido para el piloto.")
         attempt = self._connected_attempt(username)
         cached = attempt.sprint_cache.get(space)
-        now = datetime.now(timezone.utc)
+        now = datetime.now(UTC)
         if cached and not force_refresh and now - cached[0] < timedelta(minutes=5):
             return copy.deepcopy(cached[1])
         if "searchJiraIssuesUsingJql" not in attempt.available_tools:
@@ -721,6 +877,36 @@ class AtlassianIntegrationManager:
         attempt.sprint_cache[space] = (now, catalog)
         return copy.deepcopy(catalog)
 
+    async def validate_priority(
+        self,
+        username: str,
+        space: str,
+        priority: str,
+    ) -> dict[str, str]:
+        """Validate a priority name through read-only JQL before it enters a create payload."""
+
+        await self.ensure_restored(username)
+        if space not in TARGET_SPACES:
+            raise AtlassianIntegrationError("Space no permitido para el piloto.")
+        if priority not in {"Highest", "High", "Medium", "Low", "Lowest"}:
+            raise AtlassianIntegrationError("Prioridad no permitida por el modelo de voz.")
+        attempt = self._connected_attempt(username)
+        if "searchJiraIssuesUsingJql" not in attempt.available_tools:
+            raise AtlassianIntegrationError(
+                "Rovo MCP no expuso la búsqueda JQL necesaria para validar Prioridad."
+            )
+        await self._invoke(
+            attempt,
+            "searchJiraIssuesUsingJql",
+            {
+                "cloudId": (attempt.snapshot or {}).get("cloud_id"),
+                "jql": f'project = "{space}" AND priority = "{priority}" ORDER BY updated DESC',
+                "fields": ["priority"],
+                "maxResults": 1,
+            },
+        )
+        return {"name": priority}
+
     async def create_single_task_and_readback(
         self,
         username: str,
@@ -743,7 +929,7 @@ class AtlassianIntegrationManager:
 
         async def operation() -> dict[str, Any]:
             nonlocal create_started, call_count
-            async with httpx.AsyncClient(
+            async with self.new_atlassian_http_client(
                 auth=attempt.provider,
                 follow_redirects=True,
                 timeout=timeout_seconds,
@@ -773,9 +959,17 @@ class AtlassianIntegrationManager:
                                 outcome_uncertain=False,
                                 real_mcp_calls=0,
                             )
-                        create_started = True
-                        call_count = 1
                         try:
+                            # Final backend-authoritative check. Functional policy,
+                            # preflight and confirmation remain separate gates.
+                            if self.write_lock is not None:
+                                self.write_lock.assert_can_write(username, "createJiraIssue")
+                            # Mark the transport as started only after the lock
+                            # succeeds; a rejected lock is not an uncertain Jira
+                            # outcome because no MCP write was attempted.
+                            create_started = True
+                            call_count = 1
+                            create_started_at = perf_counter()
                             create_result = await session.call_tool(
                                 "createJiraIssue",
                                 copy.deepcopy(create_arguments),
@@ -789,6 +983,7 @@ class AtlassianIntegrationManager:
                                     real_mcp_calls=1,
                                 ) from exc
                             raise
+                        create_elapsed_ms = round((perf_counter() - create_started_at) * 1000, 1)
                         create_payload = _tool_payload(create_result)
                         if getattr(create_result, "isError", False):
                             raise ControlledJiraWriteError(
@@ -804,6 +999,7 @@ class AtlassianIntegrationManager:
                                 real_mcp_calls=1,
                             )
                         call_count = 2
+                        readback_started_at = perf_counter()
                         try:
                             read_result = await call_read_only_tool(
                                 session,
@@ -827,6 +1023,8 @@ class AtlassianIntegrationManager:
                                     "readback": None,
                                     "readback_error": self._redact_sensitive(str(read_payload)),
                                     "real_mcp_calls": 2,
+                                    "create_elapsed_ms": create_elapsed_ms,
+                                    "readback_elapsed_ms": round((perf_counter() - readback_started_at) * 1000, 1),
                                 }
                         except Exception as exc:
                             return {
@@ -835,6 +1033,8 @@ class AtlassianIntegrationManager:
                                 "readback": None,
                                 "readback_error": self._safe_error(exc, "READBACK_CREATED_TASK"),
                                 "real_mcp_calls": 2,
+                                "create_elapsed_ms": create_elapsed_ms,
+                                "readback_elapsed_ms": round((perf_counter() - readback_started_at) * 1000, 1),
                             }
                         return {
                             "issue_key": issue_key,
@@ -842,10 +1042,14 @@ class AtlassianIntegrationManager:
                             "readback": read_payload,
                             "readback_error": None,
                             "real_mcp_calls": 2,
+                            "create_elapsed_ms": create_elapsed_ms,
+                            "readback_elapsed_ms": round((perf_counter() - readback_started_at) * 1000, 1),
                         }
 
         try:
             return await asyncio.wait_for(operation(), timeout=timeout_seconds)
+        except GlobalJiraWriteLockError:
+            raise
         except ControlledJiraWriteError:
             raise
         except TimeoutError as exc:
@@ -874,6 +1078,36 @@ class AtlassianIntegrationManager:
         }
         return snapshot
 
+    def jira_field_catalog(
+        self,
+        username: str,
+        space: str,
+        work_type: str,
+        field_id: str,
+    ) -> dict[str, Any]:
+        """Return the verified option catalog from the existing Jira snapshot."""
+        snapshot = self.connected_snapshot(username)
+        for project in snapshot.get("spaces", []):
+            if str(project.get("key")) != space:
+                continue
+            for issue_type in project.get("work_types", []):
+                if not work_type_matches(work_type, issue_type):
+                    continue
+                for field in issue_type.get("fields", []):
+                    if str(field.get("id")) == field_id:
+                        return {
+                            "space": space,
+                            "work_type": work_type,
+                            "field_id": field_id,
+                            "field_name": field.get("name"),
+                            "options": list(field.get("options") or []),
+                            "fetched_at": snapshot.get("verified_at"),
+                            "status": "verified",
+                        }
+        raise AtlassianIntegrationError(
+            f"No se encontró el campo {field_id} para {space} / {work_type} en el catálogo Jira."
+        )
+
     async def _authorize_and_discover(self, attempt: OAuthAttempt) -> None:
         async def redirect_handler(url: str) -> None:
             attempt.authorization_url = url
@@ -886,7 +1120,11 @@ class AtlassianIntegrationManager:
             attempt.redirect_ready.set()
 
         async def callback_handler() -> tuple[str, str | None]:
-            return await attempt.callback_queue.get()
+            attempt.stage = 'OAUTH_CALLBACK'
+            try:
+                return await asyncio.wait_for(attempt.callback_queue.get(), OAUTH_CONSENT_TIMEOUT_SECONDS)
+            except TimeoutError as exc:
+                raise ConnectionFailure('OAUTH_TIMEOUT') from exc
 
         provider = self._provider(
             attempt,
@@ -896,7 +1134,7 @@ class AtlassianIntegrationManager:
         attempt.provider = provider
         attempt.stage = "OAUTH_AND_MCP_CONNECT"
         try:
-            async with httpx.AsyncClient(auth=provider, follow_redirects=True, timeout=60) as client:
+            async with self.new_atlassian_http_client(auth=provider, follow_redirects=True, timeout=60) as client:
                 async with streamable_http_client(
                     self.settings.atlassian_mcp_url,
                     http_client=client,
@@ -913,9 +1151,92 @@ class AtlassianIntegrationManager:
         except asyncio.CancelledError:
             raise
         except Exception as exc:  # pragma: no cover - real network errors vary
-            logger.exception("Atlassian OAuth/MCP connection failed")
-            attempt.error = self._safe_error(exc, attempt.stage)
+            attempt.diagnostic_failure = failure_report(exc, attempt.stage)
+            logger.warning('Atlassian connection failed phase=%s category=%s request_id=%s', attempt.stage, attempt.diagnostic_failure['error_code'], attempt.diagnostic_failure['request_id'])
+            attempt.error = attempt.diagnostic_failure['message']
             attempt.redirect_ready.set()
+        finally:
+            if attempt.oauth_state:
+                self._states.pop(attempt.oauth_state, None)
+
+    def diagnostic_attempt(self, username: str) -> OAuthAttempt:
+        """Read encrypted credentials without clearing or initiating consent."""
+        try:
+            storage = self._storage(username)
+        except RuntimeError as exc:
+            raise ConnectionFailure('OAUTH_INVALID') from exc
+        return OAuthAttempt(username=username, storage=storage)
+
+    async def diagnostic_read(self, attempt: OAuthAttempt, result: dict) -> None:
+        permission_denied = False
+
+        async def observe_response(response):
+            nonlocal permission_denied
+            if response.status_code == 403:
+                permission_denied = True
+
+        async def no_redirect(_url):
+            raise ConnectionFailure('JIRA_PERMISSION_DENIED' if permission_denied else 'OAUTH_EXPIRED')
+
+        async def no_callback():
+            raise ConnectionFailure('OAUTH_EXPIRED')
+
+        provider = self._provider(attempt, redirect_handler=no_redirect, callback_handler=no_callback)
+        result['phase'] = 'MCP_INITIALIZE'
+        async with self.new_atlassian_http_client(auth=provider, follow_redirects=True, timeout=httpx.Timeout(10, connect=5), event_hooks={'response': [observe_response]}) as client:
+            async with streamable_http_client(self.settings.atlassian_mcp_url, http_client=client) as (reader, writer, _):
+                async with ClientSession(reader, writer) as session:
+                    await session.initialize()
+                    result['checks'].update(network='OK', mcp='OK', oauth='OK')
+                    result['phase'] = 'MCP_LIST_TOOLS'
+                    available = {t.name: t for t in (await session.list_tools()).tools}
+                    required = {'atlassianUserInfo', 'getAccessibleAtlassianResources', 'getVisibleJiraProjects'}
+                    result['capabilities'] = sorted(set(available) & READ_ONLY_TOOL_ALLOWLIST)
+                    if required - set(available):
+                        raise ConnectionFailure('MCP_CAPABILITIES_MISSING')
+                    result['checks']['capabilities'] = 'OK'
+
+                    async def read(name, values=None):
+                        result['tools_invoked'].append(name)
+                        response = await call_read_only_tool(session, name, _schema_arguments(available[name], values or {}))
+                        if getattr(response, 'isError', False):
+                            payload = str(_tool_payload(response)).casefold()
+                            if '403' in payload or 'forbidden' in payload or 'permission' in payload:
+                                raise ConnectionFailure('JIRA_PERMISSION_DENIED')
+                            if '401' in payload or 'unauthorized' in payload:
+                                raise ConnectionFailure('OAUTH_INVALID')
+                            raise ConnectionFailure('JIRA_SITE_UNAVAILABLE')
+                        return _tool_payload(response)
+
+                    result['phase'] = 'READ_USER'
+                    account = await read('atlassianUserInfo')
+                    if not isinstance(account, dict) or not (account.get('accountId') or account.get('account_id') or account.get('id')):
+                        raise ConnectionFailure('ATLASSIAN_ACCOUNT_UNAVAILABLE')
+                    result['account'] = account.get('displayName') or account.get('name')
+                    result['checks']['account'] = 'OK'
+                    result['phase'] = 'READ_ACCESSIBLE_RESOURCES'
+                    resources = _records(await read('getAccessibleAtlassianResources'), ('resources', 'sites'))
+                    resource = next((r for r in resources if urlparse(str(r.get('url', ''))).hostname == urlparse(self.settings.atlassian_site_url).hostname), None)
+                    if not resource:
+                        raise ConnectionFailure('JIRA_SITE_UNAVAILABLE')
+                    cloud = resource.get('id') or resource.get('cloudId') or resource.get('cloud_id')
+                    if not cloud:
+                        raise ConnectionFailure('JIRA_SITE_UNAVAILABLE')
+                    result['checks']['site'] = 'OK'
+                    result['phase'] = 'READ_VISIBLE_PROJECTS'
+                    # Bounded pagination avoids declaring AT absent from a partial first page.
+                    for offset in range(0, 1000, 50):
+                        payload = await read('getVisibleJiraProjects', {'cloudId': cloud, 'maxResults': 50, 'startAt': offset})
+                        projects = _records(payload, ('projects',))
+                        if any(str(p.get('key', '')).upper() == 'AT' for p in projects):
+                            result['checks']['space'] = 'OK'
+                            attempt.provider = provider
+                            return
+                        if len(projects) < 50 or (isinstance(payload, dict) and payload.get('isLast') is True):
+                            raise ConnectionFailure('SPACE_UNAVAILABLE')
+                        if not _schema_arguments(available['getVisibleJiraProjects'], {'startAt': offset}):
+                            raise ConnectionFailure('MCP_CAPABILITIES_MISSING')
+                    raise ConnectionFailure('MCP_CAPABILITIES_MISSING')
 
     def _provider(
         self,
@@ -954,7 +1275,7 @@ class AtlassianIntegrationManager:
     async def _discover(self, attempt: OAuthAttempt) -> dict[str, Any]:
         if attempt.provider is None:
             raise AtlassianIntegrationError("No existe un proveedor OAuth activo.")
-        async with httpx.AsyncClient(auth=attempt.provider, follow_redirects=True, timeout=60) as client:
+        async with self.new_atlassian_http_client(auth=attempt.provider, follow_redirects=True, timeout=60) as client:
             async with streamable_http_client(
                 self.settings.atlassian_mcp_url,
                 http_client=client,
@@ -966,6 +1287,74 @@ class AtlassianIntegrationManager:
                     tools_result = await session.list_tools()
                     attempt.available_tools = {tool.name: tool for tool in tools_result.tools}
                     return await self._discover_with_session(attempt, session)
+
+    async def _read_all_issue_type_fields(
+        self,
+        attempt: OAuthAttempt,
+        session: McpSessionLike,
+        *,
+        cloud_id: str,
+        project_id_or_key: str,
+        issue_type_id: str,
+    ) -> list[dict[str, Any]]:
+        """Read required and optional create fields across every metadata page."""
+
+        fields_by_id: dict[str, dict[str, Any]] = {}
+        start_at = 0
+        previous_page_ids: tuple[str, ...] | None = None
+        for _page_number in range(FIELD_METADATA_MAX_PAGES):
+            field_payload = await self._invoke_with_session(
+                attempt,
+                session,
+                "getJiraIssueTypeMetaWithFields",
+                {
+                    "cloudId": cloud_id,
+                    "projectKey": project_id_or_key,
+                    "issueTypeId": issue_type_id,
+                    "startAt": start_at,
+                    "maxResults": FIELD_METADATA_MAX_RESULTS,
+                    # Atlassian defaults this flag to true. Business fields such as
+                    # Sprint and tracking type are optional and would be omitted.
+                    "requiredFieldsOnly": False,
+                },
+            )
+            page_fields = _field_records(field_payload)
+            page_ids = tuple(
+                str(field.get("fieldId") or field.get("key") or field.get("id") or "")
+                for field in page_fields
+            )
+            if previous_page_ids is not None and page_ids == previous_page_ids:
+                break
+            previous_page_ids = page_ids
+            for field in page_fields:
+                field_id = str(
+                    field.get("fieldId") or field.get("key") or field.get("id") or ""
+                ).strip()
+                identity = field_id or _normalize_identity(field.get("name"))
+                if identity:
+                    fields_by_id.setdefault(identity, field)
+
+            if not page_fields:
+                break
+            if not isinstance(field_payload, dict):
+                break
+            if field_payload.get("isLast") is True:
+                break
+            total = field_payload.get("total")
+            if isinstance(total, (int, float)) and start_at + len(page_fields) >= int(total):
+                break
+            if (
+                "total" not in field_payload
+                and "isLast" not in field_payload
+                and len(page_fields) < FIELD_METADATA_MAX_RESULTS
+            ):
+                break
+            start_at += len(page_fields)
+        else:
+            raise AtlassianIntegrationError(
+                "Los metadatos de campos Jira excedieron el límite seguro de paginación."
+            )
+        return list(fields_by_id.values())
 
     async def _discover_with_session(
         self,
@@ -980,11 +1369,11 @@ class AtlassianIntegrationManager:
             )
 
         attempt.stage = "READ_USER"
-        user_payload = _tool_payload(await call_read_only_tool(session, "atlassianUserInfo"))
+        user_payload = await self._invoke_with_session(attempt, session, 'atlassianUserInfo', {})
+        if not isinstance(user_payload, dict) or not (user_payload.get('accountId') or user_payload.get('account_id') or user_payload.get('id')):
+            raise ConnectionFailure('ATLASSIAN_ACCOUNT_UNAVAILABLE')
         attempt.stage = "READ_ACCESSIBLE_RESOURCES"
-        resources_payload = _tool_payload(
-            await call_read_only_tool(session, "getAccessibleAtlassianResources")
-        )
+        resources_payload = await self._invoke_with_session(attempt, session, 'getAccessibleAtlassianResources', {})
         resources = _records(resources_payload, ("resources", "sites"))
         expected_host = urlparse(self.settings.atlassian_site_url).hostname
         resource = next(
@@ -1049,21 +1438,20 @@ class AtlassianIntegrationManager:
                 if (
                     issue["id"]
                     and "getJiraIssueTypeMetaWithFields" in attempt.available_tools
-                    and str(issue["name"] or "").lower()
-                    in {"epic", "story", "task", "bug", "subtask", "sub-task"}
+                    and (
+                        bool(issue.get("subtask"))
+                        or _normalize_identity(issue["name"])
+                        in {"epic", "story", "task", "bug", "subtask", "sub-task", "subtarea"}
+                    )
                 ):
                     attempt.stage = f"READ_FIELDS_{project['key']}_{issue['name']}"
-                    field_payload = await self._invoke_with_session(
+                    fields = await self._read_all_issue_type_fields(
                         attempt,
                         session,
-                        "getJiraIssueTypeMetaWithFields",
-                        {
-                            "cloudId": cloud_id,
-                            "projectKey": project["id"] or project["key"],
-                            "issueTypeId": issue["id"],
-                        },
+                        cloud_id=str(cloud_id),
+                        project_id_or_key=str(project["id"] or project["key"]),
+                        issue_type_id=str(issue["id"]),
                     )
-                    fields = _field_records(field_payload)
                     assignee_field = next(
                         (
                             field
@@ -1139,7 +1527,7 @@ class AtlassianIntegrationManager:
     ) -> Any:
         if attempt.provider is None:
             raise AtlassianIntegrationError("No existe un proveedor OAuth activo.")
-        async with httpx.AsyncClient(auth=attempt.provider, follow_redirects=True, timeout=60) as client:
+        async with self.new_atlassian_http_client(auth=attempt.provider, follow_redirects=True, timeout=60) as client:
             async with streamable_http_client(
                 self.settings.atlassian_mcp_url,
                 http_client=client,
@@ -1159,7 +1547,25 @@ class AtlassianIntegrationManager:
         tool = attempt.available_tools.get(name)
         if tool is None:
             raise AtlassianIntegrationError(f"El servidor MCP no expuso la herramienta '{name}'.")
-        result = await call_read_only_tool(session, name, _schema_arguments(tool, values))
+        started = perf_counter()
+        trace = current_trace()
+        if trace is not None:
+            trace.call_started()
+        try:
+            result = await call_read_only_tool(session, name, _schema_arguments(tool, values))
+        except Exception:
+            if trace is not None:
+                trace.record_call(name, (perf_counter() - started) * 1000, result="ERROR")
+            raise
+        finally:
+            if trace is not None:
+                trace.call_finished()
+        if trace is not None:
+            trace.record_call(
+                name,
+                (perf_counter() - started) * 1000,
+                result="ERROR" if getattr(result, "isError", False) else "OK",
+            )
         if getattr(result, "isError", False):
             payload = _tool_payload(result)
             raise AtlassianIntegrationError(f"Atlassian rechazó '{name}': {payload}")
@@ -1175,7 +1581,8 @@ class AtlassianIntegrationManager:
         if attempt.task and attempt.task.done() and not attempt.task.cancelled():
             exception = attempt.task.exception()
             if exception:
-                attempt.error = self._safe_error(exception, attempt.stage)
+                attempt.diagnostic_failure = failure_report(exception, attempt.stage)
+                attempt.error = attempt.diagnostic_failure['message']
         if attempt.error:
             raise AtlassianIntegrationError(attempt.error)
 
@@ -1217,6 +1624,8 @@ class AtlassianIntegrationManager:
 
     @staticmethod
     def _redact_sensitive(value: str) -> str:
+        value = re.sub(r'(?i)Bearer\s+[^\s"\x27,;]+', 'Bearer [REDACTED]', value)
+        value = re.sub(r'(?i)(["\x27]?(?:access_token|refresh_token|id_token|client_secret|cookie|set-cookie|authorization|code_verifier|code_challenge|state|code)["\x27]?\s*[:=]\s*)(?:"[^"\n]*"|\x27[^\x27\n]*\x27|[^\s,;&]+)', r'\1[REDACTED]', value)
         redacted = re.sub(
             r"(?i)(access_token|refresh_token|authorization|client_secret)\s*[:=]\s*[^\s,;&]+",
             r"\1=[REDACTED]",

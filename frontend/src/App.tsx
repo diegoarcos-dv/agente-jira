@@ -1,24 +1,28 @@
-import { FormEvent, useEffect, useMemo, useState } from "react";
+import { FormEvent, type ReactNode, useEffect, useMemo, useRef, useState } from "react";
 import {
   ApiError,
   approveProposalAndDryRun,
   archiveProposal,
+  bulkUpdateProposal,
+  trashProposal,
   cancelObjective4ASimulation,
   confirmObjective4BWrite,
   confirmObjective4ASimulation,
-  connectAtlassian,
+  connectAtlassianExternal,
   createProposal,
-  disconnectAtlassian,
+  preflightProposal,
   downloadDryRunEvidence,
   downloadObjective4AEvidence,
   downloadObjective4BEvidence,
   downloadObjective4C1Evidence,
   executeObjective4C1Batch,
   executeObjective4BWrite,
+  excludeProposalItems,
   findJiraAssignees,
   listJiraSprints,
   generateJiraDryRun,
   getAtlassianStatus,
+  lockJiraWrites,
   getLatestJiraDryRun,
   getLatestObjective4ASimulation,
   getLatestObjective4C1Batch,
@@ -26,19 +30,25 @@ import {
   getObjective4C2Progress,
   getProposal,
   listProposals,
-  login,
+  getCurrentSession,
+  logout as logoutSession,
   prepareObjective4ASimulation,
   prepareObjective4BWrite,
   prepareObjective4C1Batch,
+  revalidateObjective4C1Batch,
   confirmObjective4C1Batch,
   reactivateProposalItem,
   refreshAtlassian,
   renameProposal,
+  permanentlyDeleteProposal,
   reopenProposal,
   restoreProposal,
   runObjective4ASimulation,
+  unlockJiraWrites,
+  unlinkAtlassian,
   updateProposalItem,
   updateProposalDefaults,
+  startAtlassianLogin,
 } from "./api";
 import type {
   AtlassianStatus,
@@ -60,9 +70,52 @@ import type {
   Space,
   WorkType,
 } from "./types";
+import { ThemeToggle } from "./ThemeToggle";
+import { applyTheme, readInitialTheme, type Theme } from "./theme";
+import { VoiceAssistant } from "./voice/VoiceAssistant";
+import { SESSION_EXPIRED_EVENT } from "./authEvents";
+import { diagnoseAtlassian } from './api';
+import { JiraDiagnostics } from './JiraDiagnostics';
+import { NewProposal, MinutesReview } from "./Minutes";
+import { Dashboard } from "./Dashboard";
+import { Onboarding } from "./Onboarding";
+import { emitOnboardingEvent } from "./onboardingEvents";
 
-const SESSION_KEY = "agente-jira-local-session";
 const SIDEBAR_KEY = "agente-jira-sidebar-collapsed";
+// Temporarily keep voice out of the main workspace while its integration is repaired.
+const VOICE_UI_ENABLED = false;
+
+function userInitials(displayName: string): string {
+  const initials = displayName.trim().split(/\s+/).filter(Boolean).slice(0, 2).map(part => part[0]).join("");
+  return initials.toUpperCase() || "AJ";
+}
+
+type IconName = "plus" | "sliders" | "chevron-left" | "chevron-right" | "download" | "upload" | "shield" | "pencil" | "dashboard" | "users" | "file" | "bolt" | "lock" | "check" | "arrow-right";
+
+function Icon({ name, className = "" }: { name: IconName; className?: string }) {
+  const paths: Record<IconName, ReactNode> = {
+    plus: <><path d="M12 5v14" /><path d="M5 12h14" /></>,
+    sliders: <><path d="M4 7h7" /><path d="M15 7h5" /><circle cx="13" cy="7" r="2" /><path d="M4 17h3" /><path d="M11 17h9" /><circle cx="9" cy="17" r="2" /></>,
+    "chevron-left": <path d="m15 18-6-6 6-6" />,
+    "chevron-right": <path d="m9 18 6-6-6-6" />,
+    download: <><path d="M12 4v11" /><path d="m8 11 4 4 4-4" /><path d="M5 20h14" /></>,
+    upload: <><path d="M12 20V9" /><path d="m8 13 4-4 4 4" /><path d="M5 4h14" /></>,
+    shield: <><path d="M12 3 5 6v5c0 4.6 2.8 8.2 7 10 4.2-1.8 7-5.4 7-10V6l-7-3Z" /><path d="m9 12 2 2 4-4" /></>,
+    pencil: <><path d="m16 5 3 3" /><path d="M4 20h4l11-11a2.1 2.1 0 0 0-4-4L4 16v4Z" /></>,
+    dashboard: <><rect x="3.5" y="3.5" width="7" height="7" rx="1" /><rect x="13.5" y="3.5" width="7" height="4" rx="1" /><rect x="13.5" y="10.5" width="7" height="10" rx="1" /><rect x="3.5" y="13.5" width="7" height="7" rx="1" /></>,
+    users: <><circle cx="9" cy="8" r="3" /><path d="M3.5 20a5.5 5.5 0 0 1 11 0" /><path d="M16 5.5a3 3 0 0 1 0 5.8" /><path d="M17 14.5a5.2 5.2 0 0 1 3.5 5" /></>,
+    file: <><path d="M6 3.5h8l4 4V20.5H6z" /><path d="M14 3.5v4h4" /><path d="M9 12h6M9 15.5h6" /></>,
+    bolt: <path d="m13.2 2.8-8 10.4h6.1l-.7 8 8.2-11h-6.2z" />,
+    lock: <><rect x="5" y="10" width="14" height="11" rx="2" /><path d="M8 10V7a4 4 0 0 1 8 0v3" /></>,
+    check: <path d="m5 12 4 4L19 6" />,
+    "arrow-right": <><path d="M5 12h14" /><path d="m13 6 6 6-6 6" /></>,
+  };
+  return (
+    <svg className={`ui-icon ${className}`} viewBox="0 0 24 24" fill="none" aria-hidden="true">
+      <g stroke="currentColor" strokeWidth="1.8" strokeLinecap="round" strokeLinejoin="round">{paths[name]}</g>
+    </svg>
+  );
+}
 
 function normalizeIdentity(value: string | null | undefined): string {
   return (value ?? "")
@@ -73,13 +126,73 @@ function normalizeIdentity(value: string | null | undefined): string {
     .toLocaleLowerCase();
 }
 
-function readSession(): Session | null {
+function jiraSiteLabel(value: string | null | undefined): string {
+  if (!value) return "Sitio no disponible";
   try {
-    const value = sessionStorage.getItem(SESSION_KEY);
-    return value ? (JSON.parse(value) as Session) : null;
+    return new URL(value).hostname.replace(/^www\./, "");
   } catch {
-    return null;
+    return value.replace(/^https?:\/\//, "").replace(/\/$/, "");
   }
+}
+
+type GeneralValueKey = keyof Omit<ProposalDefaults, "space">;
+type GeneralValueOption = { value: string; label: string };
+
+const GENERAL_VALUE_FIELDS: Array<{
+  key: GeneralValueKey;
+  label: string;
+}> = [
+  { key: "iniciativa", label: "Iniciativa" },
+  { key: "linea_trabajo", label: "L\u00ednea de trabajo" },
+  { key: "sprint", label: "Sprint" },
+  { key: "tipo_seguimiento", label: "Tipo de seguimiento" },
+  { key: "semaforo", label: "Sem\u00e1foro" },
+];
+
+function inferBusinessKey(name: string | null | undefined): GeneralValueKey | null {
+  const normalized = normalizeIdentity(name).replace(/_/g, " ");
+  const aliases: Record<string, GeneralValueKey> = {
+    iniciativa: "iniciativa",
+    initiative: "iniciativa",
+    "linea de trabajo": "linea_trabajo",
+    "linea trabajo": "linea_trabajo",
+    workstream: "linea_trabajo",
+    sprint: "sprint",
+    "tipo de seguimiento": "tipo_seguimiento",
+    "tipo seguimiento": "tipo_seguimiento",
+    semaforo: "semaforo",
+    "traffic light": "semaforo",
+  };
+  return aliases[normalized] ?? null;
+}
+
+function buildGeneralValueCatalogs(
+  status: AtlassianStatus | null,
+  spaceKey: Space,
+  sprints: JiraSprint[],
+): Map<GeneralValueKey, GeneralValueOption[]> {
+  const result = new Map<GeneralValueKey, GeneralValueOption[]>();
+  const space = status?.snapshot?.spaces.find((candidate) => candidate.key === spaceKey);
+  for (const workType of space?.work_types ?? []) {
+    for (const field of workType.fields) {
+      const key = field.business_key ?? inferBusinessKey(field.name);
+      if (!key) continue;
+      const current = result.get(key) ?? [];
+      for (const option of field.options ?? []) {
+        if (!current.some((candidate) => normalizeIdentity(candidate.value) === normalizeIdentity(option.value))) {
+          current.push({ value: option.value, label: option.label });
+        }
+      }
+      result.set(key, current.sort((left, right) => left.label.localeCompare(right.label, "es")));
+    }
+  }
+  if (sprints.length > 0) {
+    result.set("sprint", sprints.map((sprint) => ({
+      value: sprint.name,
+      label: `${sprint.name} \u00b7 ${sprint.state === "active" ? "Activo" : "Futuro"}`,
+    })));
+  }
+  return result;
 }
 
 function Logo() {
@@ -94,19 +207,30 @@ function Logo() {
   );
 }
 
-function LoginScreen({ onLogin }: { onLogin: (session: Session) => void }) {
-  const [username, setUsername] = useState("admin@agentejira.local");
-  const [password, setPassword] = useState("AgenteJira2026!");
+function LoginScreen() {
   const [error, setError] = useState("");
   const [loading, setLoading] = useState(false);
-  const [showPassword, setShowPassword] = useState(false);
 
-  async function submit(event: FormEvent) {
-    event.preventDefault();
+  useEffect(() => {
+    const code = new URLSearchParams(window.location.search).get("auth");
+    if (!code) return;
+    const messages: Record<string, string> = {
+      ACCESS_DENIED: "La autorización de Atlassian fue cancelada.",
+      STATE_INVALID: "La sesión de inicio ya no es válida. Intenta de nuevo.",
+      TOKEN_EXCHANGE_FAILED: "Atlassian no pudo completar la autorización. Intenta de nuevo.",
+      NO_ALLOWED_LOCAL_USER: "Tu cuenta Atlassian fue autenticada, pero no tienes acceso al Agente Jira.",
+      IDENTITY_UNAVAILABLE: "Atlassian no entregó la identidad requerida. Intenta de nuevo.",
+    };
+    if (messages[code]) setError(messages[code]);
+    window.history.replaceState({}, "", window.location.pathname);
+  }, []);
+
+  async function continueWithAtlassian() {
     setLoading(true);
     setError("");
     try {
-      onLogin(await login(username, password));
+      const result = await startAtlassianLogin(window.location.pathname || "/");
+      window.location.assign(result.authorization_url);
     } catch (reason) {
       setError(reason instanceof Error ? reason.message : "No fue posible iniciar sesión.");
     } finally {
@@ -119,65 +243,48 @@ function LoginScreen({ onLogin }: { onLogin: (session: Session) => void }) {
       <section className="login-story">
         <Logo />
         <div className="story-copy">
-          <span className="eyebrow">Entorno local seguro</span>
-          <h1>Convierte un plan en una propuesta que sí puedes revisar.</h1>
-          <p>
-            Carga la Plantilla Excel v1.1, concentra las excepciones y conserva
-            siempre el vínculo entre el origen y la propuesta.
-          </p>
-          <ul className="feature-list">
-            <li>Conexión personal a Jira mediante OAuth 2.1.</li>
-            <li>Metadatos y responsables consultados directamente en Jira.</li>
-            <li>Escritura bloqueada por defecto; el envío controlado exige confirmación explícita.</li>
+          <span className="eyebrow">De conversaciones a resultados</span>
+          <h1>Convierte minutas y planes en trabajo claro <span>para Jira.</span></h1>
+          <p>Carga tu minuta o plan, revisa las excepciones y crea actividades únicamente cuando todo esté confirmado.</p>
+          <ul className="feature-list login-benefits">
+            <li><span className="login-benefit-icon"><Icon name="users" /></span><span><strong>Datos y responsables desde Jira</strong><small>Consulta información real de tu entorno.</small></span></li>
+            <li><span className="login-benefit-icon"><Icon name="file" /></span><span><strong>Archivo original protegido</strong><small>Conserva la trazabilidad completa.</small></span></li>
+            <li><span className="login-benefit-icon"><Icon name="bolt" /></span><span><strong>Creación controlada y confirmada</strong><small>Tú decides qué se crea, siempre.</small></span></li>
           </ul>
         </div>
-        <p className="security-note">Desarrollo local · autorización Atlassian cifrada para el usuario de Windows</p>
+        <div className="login-flow-illustration" aria-hidden="true">
+          <div className="login-flow-card">
+            <div className="login-flow-file"><span className="login-flow-file-icon"><Icon name="file" /></span><span><strong>Minuta de proyecto.docx</strong><small>Analizando contenido…</small></span></div>
+            <div className="login-flow-step"><span><Icon name="check" /></span>Identificando tareas</div>
+            <div className="login-flow-step"><span><Icon name="check" /></span>Validando responsables</div>
+            <div className="login-flow-step"><span><Icon name="check" /></span>Revisando excepciones</div>
+            <div className="login-flow-ready"><span><Icon name="check" /></span>Listo para crear en Jira</div>
+          </div>
+        </div>
+        <p className="security-note"><Icon name="shield" /><span><strong>Entorno local seguro</strong><small>Solo tu organización</small></span></p>
       </section>
       <section className="login-panel">
-        <form className="login-card" onSubmit={submit}>
-          <span className="eyebrow">Acceso de desarrollo</span>
-          <h2>Inicia sesión</h2>
+        <section className="login-card">
+          <span className="eyebrow">Acceso corporativo</span>
+          <h2>Accede con tu cuenta corporativa</h2>
           <p className="muted">
-            Esta interfaz está preparada para sustituir el proveedor local por Cognito.
+            Usa tu cuenta de Atlassian para identificarte. Agente Jira no recibe ni almacena tu contraseña.
           </p>
-          <label>
-            Correo
-            <input
-              type="email"
-              value={username}
-              onChange={(event) => setUsername(event.target.value)}
-              autoComplete="username"
-              required
-            />
-          </label>
-          <label>
-            Contraseña
-            <span className="password-field">
-              <input
-                type={showPassword ? "text" : "password"}
-                value={password}
-                onChange={(event) => setPassword(event.target.value)}
-                autoComplete="current-password"
-                required
-              />
-              <button
-                type="button"
-                className="password-toggle"
-                onClick={() => setShowPassword((value) => !value)}
-                aria-label={showPassword ? "Ocultar contraseña" : "Mostrar contraseña"}
-              >
-                {showPassword ? "Ocultar" : "Mostrar"}
-              </button>
-            </span>
-          </label>
-          <p className="login-help">
-            La recuperación de contraseña se habilitará con Cognito en el entorno corporativo.
-          </p>
-          {error && <div className="alert error">{error}</div>}
-          <button className="button primary full" disabled={loading}>
-            {loading ? "Validando…" : "Entrar al espacio de trabajo"}
+          <button type="button" className="button primary full login-atlassian-button" onClick={continueWithAtlassian} disabled={loading}>
+            <span className="login-atlassian-mark" aria-hidden="true">A</span>
+            <span>{loading ? "Conectando con Atlassian…" : "Continuar con Atlassian"}</span>
+            {!loading && <Icon name="arrow-right" className="login-button-arrow" />}
+            {loading && <span className="login-spinner" aria-hidden="true" />}
           </button>
-        </form>
+          <div className="login-divider"><span>Una sola cuenta para entrar y consultar Jira.</span></div>
+          <ul className="login-trust-list">
+            <li><Icon name="check" />Se respetan tus permisos reales de Jira.</li>
+            <li><Icon name="check" />Acceso seguro a través de Atlassian.</li>
+          </ul>
+          {error && <div className="alert error">{error}</div>}
+          <div className="login-credential-note"><span className="login-credential-icon"><Icon name="lock" /></span><span><strong>Tu contraseña permanece con Atlassian.</strong><small>Agente Jira no la almacena ni la procesa.</small></span></div>
+        </section>
+        <div className="login-panel-footer"><span>AGENTE JIRA</span><small>Planificación inteligente. Equipos más fuertes.</small></div>
       </section>
     </main>
   );
@@ -188,21 +295,55 @@ interface UploadPanelProps {
   onCreated: (proposal: Proposal) => void;
 }
 
-function UploadPanel({ token, onCreated }: UploadPanelProps) {
+export function UploadPanel({ token, onCreated }: UploadPanelProps) {
   const [file, setFile] = useState<File | null>(null);
   const [space, setSpace] = useState<Space>("AT");
   const [expanded, setExpanded] = useState(false);
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState<ApiError | null>(null);
+  const [jiraStatus, setJiraStatus] = useState<AtlassianStatus | null>(null);
+  const [catalogLoading, setCatalogLoading] = useState(true);
+  const [catalogError, setCatalogError] = useState("");
   const [sprints, setSprints] = useState<JiraSprint[]>([]);
+  const [sprintsLoading, setSprintsLoading] = useState(false);
 
   useEffect(() => {
     let active = true;
+    setCatalogLoading(true);
+    getAtlassianStatus(token)
+      .then((result) => { if (active) setJiraStatus(result); })
+      .catch((reason) => {
+        if (active) setCatalogError(reason instanceof Error ? reason.message : "No fue posible consultar los catálogos de Jira.");
+      })
+      .finally(() => { if (active) setCatalogLoading(false); });
+    return () => { active = false; };
+  }, [token]);
+
+  useEffect(() => {
+    let active = true;
+    if (!expanded || !jiraStatus?.connected) {
+      setSprints([]);
+      setSprintsLoading(false);
+      return () => { active = false; };
+    }
+    setSprintsLoading(true);
+    setCatalogError("");
     listJiraSprints(token, space)
       .then((result) => { if (active) setSprints(result); })
-      .catch(() => { if (active) setSprints([]); });
+      .catch((reason) => {
+        if (active) {
+          setSprints([]);
+          setCatalogError(reason instanceof Error ? reason.message : "No fue posible recuperar los Sprints de Jira.");
+        }
+      })
+      .finally(() => { if (active) setSprintsLoading(false); });
     return () => { active = false; };
-  }, [token, space]);
+  }, [expanded, jiraStatus?.connected, token, space]);
+
+  const catalogs = useMemo(
+    () => buildGeneralValueCatalogs(jiraStatus, space, sprints),
+    [jiraStatus, space, sprints],
+  );
 
   async function submit(event: FormEvent<HTMLFormElement>) {
     event.preventDefault();
@@ -213,7 +354,10 @@ function UploadPanel({ token, onCreated }: UploadPanelProps) {
     values.set("file", file);
     values.set("space", space);
     try {
-      onCreated(await createProposal(token, values));
+      const created = await createProposal(token, values);
+      // Preflight is read-only; an unavailable Jira connection must not block local review.
+      void preflightProposal(token, created.proposal_id).catch(() => undefined);
+      onCreated(created);
     } catch (reason) {
       setError(
         reason instanceof ApiError
@@ -225,18 +369,58 @@ function UploadPanel({ token, onCreated }: UploadPanelProps) {
     }
   }
 
+  async function downloadTemplate() {
+    const response = await fetch("/api/template/v1.3", {
+      headers: { Authorization: `Bearer ${token}` },
+    });
+    if (!response.ok) {
+      setError(new ApiError("No fue posible generar la plantilla con el catálogo actual de Jira.", response.status));
+      return;
+    }
+    if (response.headers.get("X-Catalog-Status") === "unavailable") {
+      setError(new ApiError("No fue posible actualizar el catálogo de Jira. Puedes capturar la actividad, pero el Tipo de seguimiento deberá validarse al importar.", 200));
+    }
+    const blob = await response.blob();
+    const url = URL.createObjectURL(blob);
+    const anchor = document.createElement("a");
+    anchor.href = url;
+    anchor.download = "plantilla_plan_trabajo_jira_v1_3.xlsx";
+    anchor.click();
+    URL.revokeObjectURL(url);
+  }
+
   return (
-    <section className="upload-card">
-      <div className="section-heading">
+    <section className="upload-card upload-studio">
+      <aside className="upload-intro">
         <div>
-          <span className="eyebrow">Nueva propuesta</span>
-          <h2>Carga el plan de trabajo</h2>
+          <span className="upload-number">01</span>
+          <span className="eyebrow">Crear actividades</span>
+          <h2>Del Excel a un plan claro y revisable.</h2>
+          <p>
+            El agente organiza las actividades, consulta los valores de Jira y separa
+            únicamente lo que necesita tu atención.
+          </p>
         </div>
-        <a className="text-link" href="/api/template">
-          Descargar plantilla v1.1
-        </a>
-      </div>
-      <form onSubmit={submit}>
+        <ol className="upload-roadmap" aria-label="Flujo de preparación">
+          <li className="active"><span>1</span><div><strong>Cargar el archivo</strong><small>Conservamos el original sin cambios</small></div></li>
+          <li><span>2</span><div><strong>Revisar excepciones</strong><small>Sólo verás decisiones que requieren criterio</small></div></li>
+          <li><span>3</span><div><strong>Comprobar con Jira</strong><small>Nada se crea sin tu confirmación</small></div></li>
+        </ol>
+        <button type="button" className="template-link" onClick={() => void downloadTemplate()}>
+          <span><Icon name="download" /></span>
+          <div><strong>Descargar plantilla Excel</strong><small>Versión 1.2 · catálogos guiados (compatible con v1.1)</small></div>
+        </button>
+      </aside>
+      <form className="upload-workbench" onSubmit={submit}>
+        <div className="upload-form-heading">
+          <div>
+            <span className="eyebrow">Datos de entrada</span>
+            <h3>Prepara tu archivo</h3>
+          </div>
+          <span className={`jira-sync-state ${jiraStatus?.connected ? "online" : ""}`}>
+            <i></i>{catalogLoading ? "Consultando Jira" : jiraStatus?.connected ? "Jira sincronizada" : "Jira sin conectar"}
+          </span>
+        </div>
         <label className={`drop-zone ${file ? "has-file" : ""}`}>
           <input
             type="file"
@@ -244,12 +428,12 @@ function UploadPanel({ token, onCreated }: UploadPanelProps) {
             onChange={(event) => setFile(event.target.files?.[0] ?? null)}
             required
           />
-          <span className="upload-icon">↑</span>
-          <strong>{file ? file.name : "Selecciona la Plantilla Excel v1.1"}</strong>
+          <span className="upload-icon"><Icon name={file ? "shield" : "upload"} /></span>
+          <strong>{file ? file.name : "Arrastra o selecciona tu Excel"}</strong>
           <small>
             {file
               ? `${(file.size / 1024).toFixed(1)} KB · lista para validar`
-              : "Archivo .xlsx, máximo 10 MB"}
+              : "Archivo .xlsx · máximo 10 MB"}
           </small>
         </label>
         <div className="form-grid">
@@ -266,37 +450,65 @@ function UploadPanel({ token, onCreated }: UploadPanelProps) {
             className="button secondary optional-toggle"
             onClick={() => setExpanded((value) => !value)}
           >
-            {expanded ? "Ocultar valores opcionales" : "Agregar valores generales"}
+            {expanded ? "Ocultar campos de Jira" : "Configurar campos de Jira"}
           </button>
         </div>
         {expanded && (
-          <div className="optional-grid">
-            <label>Iniciativa<input name="iniciativa" /></label>
-            <label>Línea de trabajo<input name="linea_trabajo" /></label>
-            <label>
-              Sprint
-              {sprints.length > 0 ? (
-                <select name="sprint" defaultValue="">
-                  <option value="">
-                    {sprints.filter((sprint) => sprint.state === "active").length > 1
-                      ? "Selecciona un Sprint (hay varios activos)"
-                      : sprints.some((sprint) => sprint.state === "active")
-                        ? "Automático: usar el único Sprint activo"
-                        : "Sin Sprint"}
-                  </option>
-                  {sprints.map((sprint) => (
-                    <option key={sprint.id} value={sprint.name}>
-                      {sprint.name} · {sprint.state === "active" ? "Activo" : "Futuro"}
-                    </option>
-                  ))}
-                </select>
-              ) : (
-                <input name="sprint" placeholder="Nombre exacto en Jira (opcional)" />
-              )}
-            </label>
-            <label>Tipo de seguimiento<input name="tipo_seguimiento" /></label>
-            <label>Semáforo<input name="semaforo" /></label>
-          </div>
+          <>
+            {!catalogLoading && !jiraStatus?.connected && (
+              <div className="alert warning" role="status">
+                Conecta Jira desde Configuración Jira para cargar los valores disponibles.
+              </div>
+            )}
+            <div className="optional-grid">
+              {GENERAL_VALUE_FIELDS.map(({ key, label }) => {
+                const options = catalogs.get(key) ?? [];
+                const activeSprintCount = sprints.filter((sprint) => sprint.state === "active").length;
+                const fieldLoading = catalogLoading || (key === "sprint" && sprintsLoading);
+                return (
+                  <label key={key}>
+                    {label}
+                    <select
+                      name={key}
+                      aria-label={label}
+                      defaultValue=""
+                      disabled={fieldLoading || !jiraStatus?.connected || options.length === 0}
+                      aria-busy={fieldLoading}
+                    >
+                      <option value="">
+                        {fieldLoading
+                          ? "Cargando opciones de Jira…"
+                          : !jiraStatus?.connected
+                            ? "Conecta Jira para cargar opciones"
+                            : options.length === 0
+                              ? "Jira no publicó opciones para este campo"
+                              : key === "sprint" && activeSprintCount > 1
+                                ? "Selecciona un Sprint (hay varios activos)"
+                                : key === "sprint" && activeSprintCount === 1
+                                  ? "Automático: usar el único Sprint activo"
+                                  : "Sin valor"}
+                      </option>
+                      {options.map((option) => (
+                        <option key={option.value} value={option.value}>{option.label}</option>
+                      ))}
+                    </select>
+                    <small className={options.length > 0 ? "catalog-status live" : "catalog-status"}>
+                      {options.length > 0
+                        ? `${options.length} ${options.length === 1 ? "opción recuperada" : "opciones recuperadas"} de Jira`
+                        : fieldLoading
+                          ? "Consultando Jira…"
+                          : jiraStatus?.connected
+                            ? key === "sprint"
+                              ? "Jira no devolvió Sprints activos o futuros para este Space."
+                              : "Jira no publicó opciones para este campo."
+                            : "Conecta Jira para consultar valores reales."}
+                    </small>
+                  </label>
+                );
+              })}
+            </div>
+            {catalogError && <div className="alert warning" role="alert">{catalogError}</div>}
+          </>
         )}
         {error && (
           <div className="alert error" role="alert">
@@ -314,9 +526,9 @@ function UploadPanel({ token, onCreated }: UploadPanelProps) {
           </div>
         )}
         <div className="form-actions">
-          <span className="muted">La carga no ejecuta ninguna acción en Jira.</span>
+          <span className="muted"><b>Modo seguro:</b> todavía no se creará nada en Jira.</span>
           <button className="button primary" disabled={!file || loading}>
-            {loading ? "Validando y generando…" : "Generar propuesta"}
+            {loading ? "Preparando propuesta…" : "Preparar propuesta"}
           </button>
         </div>
       </form>
@@ -340,10 +552,14 @@ function ProposalHeader({
   proposal,
   displayName,
   onRename,
+  onEdit,
+  editDisabled,
 }: {
   proposal: Proposal;
   displayName: string;
   onRename: (name: string) => Promise<void>;
+  onEdit: () => void;
+  editDisabled: boolean;
 }) {
   const [editing, setEditing] = useState(false);
   const [name, setName] = useState(displayName);
@@ -391,12 +607,23 @@ function ProposalHeader({
           Space {proposal.defaults.space} · versión {proposal.version} · plantilla{" "}
           {proposal.template_version}
         </p>
-        <p className="source-filename">Archivo fuente inmutable: {proposal.source_file.name}</p>
+        <p className="source-filename">{proposal.minutes ? "Origen: " : "Archivo fuente inmutable: "}{proposal.source_file.name}</p>
       </div>
-      <div className="metrics" aria-label="Resumen de decisiones">
-        <div><strong>{counts.INCLUIR}</strong><span>listas</span></div>
-        <div className="review"><strong>{counts.REVISAR}</strong><span>por revisar</span></div>
-        <div><strong>{counts.EXCLUIR}</strong><span>excluidas</span></div>
+      <div className="proposal-header-side">
+        <button
+          type="button"
+          className="button secondary proposal-edit"
+          onClick={onEdit}
+          disabled={editDisabled}
+          title={editDisabled ? "La edición se habilitará al terminar la operación en curso." : "Editar actividades o valores de la propuesta"}
+        >
+          Editar propuesta
+        </button>
+        <div className="metrics" aria-label="Resumen de decisiones">
+          <div><strong>{counts.INCLUIR}</strong><span>listas</span></div>
+          <div className="review"><strong>{counts.REVISAR}</strong><span>por revisar</span></div>
+          <div><strong>{counts.EXCLUIR}</strong><span>excluidas</span></div>
+        </div>
       </div>
     </div>
   );
@@ -406,6 +633,7 @@ interface DetailPanelProps {
   token: string;
   item: ProposalItem;
   proposalItems: ProposalItem[];
+  isMinutesProposal: boolean;
   onClose: () => void;
   locked: boolean;
   correction?: JiraCorrectionItem | null;
@@ -414,6 +642,7 @@ interface DetailPanelProps {
     title: string;
     description: string;
     work_type: WorkType;
+    tipo_seguimiento: string | null;
     review_note: string | null;
     assignee_account_id: string | null;
     assignee_query: string | null;
@@ -421,6 +650,7 @@ interface DetailPanelProps {
     confirm_source_state: boolean;
     confirm_work_type: boolean;
     confirm_reactivation: boolean;
+    due_date_candidate?: string | null;
   }) => Promise<void>;
 }
 
@@ -433,6 +663,7 @@ function isRequirementResolved(
     workType: WorkType;
     parentRowId: string;
     confirmReactivation: boolean;
+    dueDate: string;
   },
 ): boolean {
   if (requirement.code === "ASSIGNEE_UNRESOLVED") return Boolean(values.assigneeAccountId);
@@ -440,13 +671,21 @@ function isRequirementResolved(
   if (requirement.code === "WORK_TYPE_UNCONFIRMED") return values.confirmWorkType;
   if (requirement.code === "SUBTASK_PARENT_MISSING") return values.workType !== "Subtask" || Boolean(values.parentRowId);
   if (requirement.code === "REACTIVATION_REVIEW_REQUIRED") return values.confirmReactivation;
+  if (requirement.code === "DUE_DATE_EXPIRED") {
+    const today = new Date();
+    const localToday = `${today.getFullYear()}-${String(today.getMonth() + 1).padStart(2, "0")}-${String(today.getDate()).padStart(2, "0")}`;
+    return /^\d{4}-\d{2}-\d{2}$/.test(values.dueDate) && values.dueDate >= localToday;
+  }
   return false;
 }
 
-function DetailPanel({ token, item, proposalItems, onClose, onSave, onReactivate, locked, correction }: DetailPanelProps) {
+function DetailPanel({ token, item, proposalItems, isMinutesProposal, onClose, onSave, onReactivate, locked, correction }: DetailPanelProps) {
   const [title, setTitle] = useState(item.generated.title);
   const [description, setDescription] = useState(item.generated.description);
+  const [dueDate, setDueDate] = useState(item.source.fecha_objetivo ?? "");
   const [workType, setWorkType] = useState(item.generated.work_type);
+  const trackingIssue = (correction?.issues ?? []).find((issue) => issue.field === "tipo_seguimiento");
+  const [tipoSeguimiento, setTipoSeguimiento] = useState(item.generated.fields.tipo_seguimiento ?? "");
   const [parentRowId, setParentRowId] = useState(item.generated.parent_row_id ?? "");
   const [note, setNote] = useState(item.review.review_note ?? "");
   const [confirmSourceState, setConfirmSourceState] = useState(false);
@@ -459,6 +698,7 @@ function DetailPanel({ token, item, proposalItems, onClose, onSave, onReactivate
       : item.generated.assignee.account_id ?? "",
   );
   const [pendingAssignee, setPendingAssignee] = useState<JiraAssignee | null>(null);
+  const [assigneeCorrectionSelected, setAssigneeCorrectionSelected] = useState(false);
   const [assigneeQuery, setAssigneeQuery] = useState<string | null>(null);
   const [saving, setSaving] = useState(false);
   const [jiraQuery, setJiraQuery] = useState(item.generated.assignee.display_name || item.source.responsable_display);
@@ -466,6 +706,7 @@ function DetailPanel({ token, item, proposalItems, onClose, onSave, onReactivate
   const [jiraLookupPerformed, setJiraLookupPerformed] = useState(false);
   const [jiraSearching, setJiraSearching] = useState(false);
   const [jiraError, setJiraError] = useState("");
+  const [saveError, setSaveError] = useState("");
 
   const requirements = item.validation.pending_requirements ?? [];
   const requirementValues = {
@@ -475,20 +716,24 @@ function DetailPanel({ token, item, proposalItems, onClose, onSave, onReactivate
     workType,
     parentRowId,
     confirmReactivation,
+    dueDate,
   };
   const requirementsWithState = requirements.map((requirement) => ({
     ...requirement,
     resolved: isRequirementResolved(requirement, requirementValues),
   }));
-  const unresolvedCount = requirementsWithState.filter((requirement) => !requirement.resolved).length;
+  const unresolvedCount = requirementsWithState.filter((requirement) => !requirement.resolved).length
+    + (trackingIssue && !tipoSeguimiento ? 1 : 0);
   async function submit(event: FormEvent) {
     event.preventDefault();
     setSaving(true);
+    setSaveError("");
     try {
       await onSave({
         title,
         description,
         work_type: workType,
+        tipo_seguimiento: tipoSeguimiento || null,
         review_note: note.trim() || null,
         assignee_account_id: pendingAssignee?.account_id ?? null,
         assignee_query: pendingAssignee ? assigneeQuery : null,
@@ -496,7 +741,10 @@ function DetailPanel({ token, item, proposalItems, onClose, onSave, onReactivate
         confirm_source_state: confirmSourceState,
         confirm_work_type: confirmWorkType,
         confirm_reactivation: confirmReactivation,
+        ...(isMinutesProposal ? { due_date_candidate: dueDate || null } : {}),
       });
+    } catch (reason) {
+      setSaveError(reason instanceof Error ? reason.message : "No fue posible guardar y volver a validar.");
     } finally {
       setSaving(false);
     }
@@ -540,6 +788,7 @@ function DetailPanel({ token, item, proposalItems, onClose, onSave, onReactivate
   function chooseJiraAssignee(assignee: JiraAssignee) {
     setJiraError("");
     setPendingAssignee(assignee);
+    setAssigneeCorrectionSelected(true);
     setAssigneeAccountId(assignee.account_id ?? "");
     setAssigneeQuery(jiraQuery.trim());
     setJiraResults([]);
@@ -565,21 +814,23 @@ function DetailPanel({ token, item, proposalItems, onClose, onSave, onReactivate
       >
         <div className="drawer-heading">
           <div>
-            <span className="eyebrow">Fila {item.source.source_row}</span>
+            <span className="eyebrow">{item.source.source_evidence ? "Actividad de minuta" : `Fila ${item.source.source_row}`}</span>
             <h2>Origen y propuesta</h2>
           </div>
           <button className="icon-button" onClick={onClose} aria-label="Cerrar">×</button>
         </div>
         {correction && (
-          <section className={`jira-correction-card ${correction.category === "TECHNICAL" ? "technical" : "action"}`} aria-label={correction.category === "TECHNICAL" ? "Validación técnica" : "Corrección requerida"}>
+          <section className={`jira-correction-card ${correction.category === "TECHNICAL" ? "technical" : "action"}`} aria-label={correction.category === "TECHNICAL" ? "Comprobación automática" : "Corrección requerida"}>
             <span className="eyebrow">
-              {correction.category === "TECHNICAL" ? "Validación técnica" : "Corrección requerida"}
+              {correction.category === "TECHNICAL" ? "Comprobación automática" : "Corrección requerida"}
             </span>
-            <strong>{correction.instruction}</strong>
+            {assigneeCorrectionSelected && correction.category === "USER_ACTION" && correction.issues.some((issue) => issue.field === "assignee") ? (
+              <strong>Responsable corregido: {pendingAssignee?.display_name}. Guarda para aplicar el cambio.</strong>
+            ) : <strong>{correction.instruction}</strong>}
             <ul>
-              {correction.issues.map((issue) => <li key={`${issue.code}-${issue.field}`}>{issue.message}</li>)}
+              {correction.issues.filter((issue) => !(assigneeCorrectionSelected && issue.field === "assignee")).map((issue) => <li key={`${issue.code}-${issue.field}`}>{issue.message}</li>)}
             </ul>
-            {correction.category === "USER_ACTION" && correction.issues.some((issue) => issue.field === "assignee") && (
+            {correction.category === "USER_ACTION" && !assigneeCorrectionSelected && correction.issues.some((issue) => issue.field === "assignee") && (
               <button
                 type="button"
                 className="button primary compact"
@@ -711,6 +962,16 @@ function DetailPanel({ token, item, proposalItems, onClose, onSave, onReactivate
               Confirmo que el Work Type seleccionado es correcto.
             </label>
           )}
+          {trackingIssue?.options && trackingIssue.options.length > 0 && (
+            <label>
+              Tipo de seguimiento
+              <select value={tipoSeguimiento} onChange={(event) => setTipoSeguimiento(event.target.value)} required>
+                <option value="">Selecciona uno vigente de Jira</option>
+                {trackingIssue.options.map((option) => <option key={option.jira_id ?? option.value} value={option.value}>{option.value}</option>)}
+              </select>
+              <small>El valor anterior se conserva en la evidencia histórica; selecciona una opción vigente.</small>
+            </label>
+          )}
           {requirements.some((requirement) => requirement.code === "REACTIVATION_REVIEW_REQUIRED") && (
             <label className="confirmation-row">
               <input
@@ -722,6 +983,9 @@ function DetailPanel({ token, item, proposalItems, onClose, onSave, onReactivate
             </label>
           )}
           <label>Descripción<textarea rows={7} value={description} onChange={(event) => setDescription(event.target.value)} required disabled={locked || item.generated.decision === "EXCLUIR"} /></label>
+          {isMinutesProposal && (
+            <label>Fecha objetivo (no es la fecha de la minuta)<input type="date" value={dueDate} onChange={(event) => setDueDate(event.target.value)} disabled={locked || item.generated.decision === "EXCLUIR"} /></label>
+          )}
           <label>Nota de revisión<textarea rows={2} value={note} onChange={(event) => setNote(event.target.value)} disabled={locked || item.generated.decision === "EXCLUIR"} /></label>
           {!locked && item.generated.decision !== "EXCLUIR" && (
             <section id={`jira-assignee-${item.generated.row_id}`} className="jira-assignee-editor" aria-label="Corregir responsable con Jira real">
@@ -782,6 +1046,7 @@ function DetailPanel({ token, item, proposalItems, onClose, onSave, onReactivate
                 : item.generated.assignee.email ?? "Cuenta Jira verificada"}
             </small>
           </div>
+          {saveError && <div className="alert error" role="alert">{saveError}</div>}
           <div className="drawer-actions">
             <button type="button" className="button secondary" onClick={onClose}>Cancelar</button>
             {!locked && item.generated.decision !== "EXCLUIR" && (
@@ -801,11 +1066,11 @@ function DryRunPanel({ dryRun, currentProposalVersion }: { dryRun: JiraDryRun; c
   const hasWarnings = dryRun.status === "READY_WITH_WARNINGS";
   const successful = dryRun.status !== "BLOCKED";
   return (
-    <section className={`dry-run-panel ${successful ? "dry-run-ready" : "dry-run-blocked"} ${hasWarnings ? "dry-run-warning" : ""} ${stale ? "dry-run-stale" : ""}`} aria-label="Resultado de la validación con Jira">
+    <section className={`dry-run-panel ${successful ? "dry-run-ready" : "dry-run-blocked"} ${hasWarnings ? "dry-run-warning" : ""} ${stale ? "dry-run-stale" : ""}`} aria-label="Resultado de la comprobación en Jira">
       <div className="dry-run-heading">
         <div>
-          <span className="eyebrow">Validación con Jira · sin escritura</span>
-          <h3>{stale ? "Resultado histórico de la validación" : dryRun.status === "READY" ? "Prevalidación completada" : hasWarnings ? "Prevalidación completada con advertencias técnicas" : "Prevalidación requiere correcciones"}</h3>
+          <span className="eyebrow">Comprobación en Jira · sin crear</span>
+          <h3>{stale ? "Resultado anterior" : dryRun.status === "READY" ? "Comprobación completada" : hasWarnings ? "Comprobación completada con advertencias" : "Hay datos por corregir"}</h3>
           <p>
             Propuesta v{dryRun.proposal_version} · {dryRun.reused ? "resultado idempotente recuperado" : "nuevo registro de auditoría"}
           </p>
@@ -874,12 +1139,14 @@ export function Objective4C1Panel({
   proposal,
   dryRun,
   onNewProposal,
+  onBusyChange,
   allowedWorkTypes = ["Task"],
 }: {
   token: string;
   proposal: Proposal;
   dryRun: JiraDryRun;
   onNewProposal: () => void;
+  onBusyChange?: (busy: boolean) => void;
   allowedWorkTypes?: WorkType[];
 }) {
   const eligible = dryRun.items.filter(
@@ -907,15 +1174,24 @@ export function Objective4C1Panel({
   const [selected, setSelected] = useState<string[]>(dependencyAwareSelection(eligible.map((item) => item.row_id)));
   const [batch, setBatch] = useState<Objective4C1Batch | null>(null);
   const [progress, setProgress] = useState<Objective4C2Progress | null>(null);
-  const [phrase, setPhrase] = useState("");
+  const [reviewConfirmed, setReviewConfirmed] = useState(false);
+  const [finalModalOpen, setFinalModalOpen] = useState(false);
+  const [authorizationExpired, setAuthorizationExpired] = useState(false);
   const [expanded, setExpanded] = useState(true);
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState("");
+  const [hydrated, setHydrated] = useState(false);
+  const autoPrepareKeyRef = useRef("");
 
   useEffect(() => {
     let active = true;
     setBatch(null);
-    setPhrase("");
+    setReviewConfirmed(false);
+    setFinalModalOpen(false);
+    setAuthorizationExpired(false);
+    setError("");
+    setHydrated(false);
+    autoPrepareKeyRef.current = "";
     Promise.allSettled([
       getLatestObjective4C1Batch(token, proposal.proposal_id),
       getObjective4C2Progress(token, proposal.proposal_id),
@@ -930,6 +1206,7 @@ export function Objective4C1Panel({
         && progressResult.value.dry_run_id === dryRun.dry_run_id
         ? progressResult.value : null;
       setBatch(currentBatch);
+      setAuthorizationExpired(Boolean(currentBatch && Date.now() > new Date(currentBatch.confirmation.expires_at).getTime()));
       setProgress(currentProgress);
       if (currentBatch) {
         setSelected(currentBatch.items.map((item) => item.row_id));
@@ -946,9 +1223,30 @@ export function Objective4C1Panel({
         const reason = progressResult.reason;
         setError(reason instanceof Error ? reason.message : "No fue posible recuperar el avance del plan.");
       }
+      setHydrated(true);
     });
     return () => { active = false; };
   }, [dryRun.dry_run_id, proposal.proposal_id, proposal.version, token]);
+
+  useEffect(() => {
+    if (!batch || !["BATCH_PREPARED", "BATCH_CONFIRMED"].includes(batch.status)) {
+      setAuthorizationExpired(false);
+      return;
+    }
+    const refresh = () => setAuthorizationExpired(Date.now() > new Date(batch.confirmation.expires_at).getTime());
+    refresh();
+    const timer = window.setInterval(refresh, 1000);
+    return () => window.clearInterval(timer);
+  }, [batch]);
+
+  const creationBusy = batch?.status === "BATCH_RUNNING"
+    || (loading && (batch?.status === "BATCH_PREPARED" || batch?.status === "BATCH_CONFIRMED"));
+
+  useEffect(() => {
+    onBusyChange?.(creationBusy);
+  }, [creationBusy, onBusyChange]);
+
+  useEffect(() => () => onBusyChange?.(false), [onBusyChange]);
 
   function toggle(rowId: string) {
     setSelected((current) => {
@@ -967,64 +1265,98 @@ export function Objective4C1Panel({
     setLoading(true); setError("");
     try {
       setBatch(await prepareObjective4C1Batch(token, proposal.proposal_id, selected));
-      setPhrase("");
     } catch (reason) {
       setError(reason instanceof Error ? reason.message : "No fue posible preparar el lote.");
     } finally { setLoading(false); }
   }
 
-  async function confirm() {
+  async function confirmAndExecute() {
     if (!batch) return;
     setLoading(true); setError("");
     try {
-      setBatch(await confirmObjective4C1Batch(token, batch.execution_id, batch.payload_hash, phrase));
+      const confirmedBatch = await confirmObjective4C1Batch(
+        token,
+        batch.execution_id,
+        batch.payload_hash,
+        batch.confirmation_phrase,
+      );
+      setFinalModalOpen(false);
+      setBatch(confirmedBatch);
+      // A deliberate "Escribir en Jira" action owns the short write window;
+      // users should not have to understand or operate a separate lock switch.
+      await unlockJiraWrites(token);
+      const result = await executeObjective4C1Batch(token, confirmedBatch.execution_id);
+      setBatch(result);
+      setProgress(await getObjective4C2Progress(token, proposal.proposal_id));
     } catch (reason) {
-      setError(reason instanceof Error ? reason.message : "No fue posible confirmar el lote.");
+      setError(reason instanceof Error ? reason.message : "No fue posible confirmar y crear el lote.");
     } finally { setLoading(false); }
   }
 
-  async function execute() {
+  async function revalidate() {
     if (!batch) return;
     setLoading(true); setError("");
     try {
+      const refreshed = await revalidateObjective4C1Batch(token, batch.execution_id);
+      setBatch(refreshed);
+      setReviewConfirmed(false);
+      setAuthorizationExpired(false);
+    } catch (reason) {
+      setError(reason instanceof Error ? reason.message : "No fue posible verificar nuevamente.");
+    } finally { setLoading(false); }
+  }
+
+  async function writeToJira() {
+    if (!batch) return;
+    setLoading(true); setError("");
+    try {
+      await unlockJiraWrites(token);
       const result = await executeObjective4C1Batch(token, batch.execution_id);
       setBatch(result);
       setProgress(await getObjective4C2Progress(token, proposal.proposal_id));
     } catch (reason) {
-      setError(reason instanceof Error ? reason.message : "No fue posible ejecutar el lote.");
+      setError(reason instanceof Error ? reason.message : "No fue posible escribir el lote en Jira.");
     } finally { setLoading(false); }
   }
 
   function continueWithNextBatch() {
     if (!progress) return;
     setBatch(null);
-    setPhrase("");
     setError("");
     setSelected(dependencyAwareSelection(progress.available_row_ids));
+    autoPrepareKeyRef.current = "";
   }
 
   const availableIds = new Set(progress?.available_row_ids ?? eligible.map((item) => item.row_id));
   const selectable = eligible.filter((item) => availableIds.has(item.row_id));
 
+  useEffect(() => {
+    if (!hydrated || batch || loading || error || selected.length < 1 || selected.length > 5 || selectable.length === 0) return;
+    const key = `${proposal.version}:${dryRun.dry_run_id}:${selected.join("|")}`;
+    if (autoPrepareKeyRef.current === key) return;
+    autoPrepareKeyRef.current = key;
+    void prepare();
+  }, [batch, dryRun.dry_run_id, error, hydrated, loading, proposal.version, selectable.length, selected]);
+
   const terminal = batch && ["COMPLETED", "STOPPED_REJECTED", "STOPPED_UNKNOWN", "STOPPED_UNVERIFIED"].includes(batch.status);
   const title = batch?.status === "COMPLETED" ? "Lote creado y verificado"
     : batch?.status.startsWith("STOPPED_") ? "Lote detenido de forma segura"
       : batch?.status === "BATCH_CONFIRMED" ? "Lote autorizado para escritura"
-        : batch?.status === "BATCH_PREPARED" ? "Revisar y confirmar lote"
-          : hierarchyMode ? "Crear actividades y sus relaciones" : "Crear un lote controlado de Tasks";
+        : batch?.status === "BATCH_PREPARED" ? "Confirmar creación en Jira"
+          : hierarchyMode ? "Resumen final de actividades y relaciones" : "Resumen final para crear en Jira";
 
   return (
     <section id="controlled-batch" className="objective4a-panel current-step-card" aria-label="Lote controlado de Jira">
       <header className="objective4a-heading">
         <div>
-          <span className="eyebrow">Paso actual · envío controlado</span>
+          <span className="eyebrow">Paso 2 · confirmar y crear</span>
           <h3>{multiType ? title.replace("Tasks", "actividades") : title}</h3>
-          <p>Selecciona de 1 a 5 {hierarchyMode ? "actividades Task, Bug, Story, Epic o Subtask" : multiType ? "actividades Task, Bug o Story" : "Tasks"}. Se crearán una por una y el lote se detendrá ante la primera anomalía.</p>
+          <p>El resumen se prepara automáticamente con hasta 5 {hierarchyMode ? "actividades Task, Bug, Story, Epic o Subtask" : multiType ? "actividades Task, Bug o Story" : "Tasks"}. Revisa el contenido antes de confirmar; se crearán una por una y el proceso se detendrá ante la primera anomalía.</p>
         </div>
         <div className="section-heading-actions">
           <div className={`simulation-seal ${batch?.status === "COMPLETED" ? "real-success" : ""}`}>
-            <strong>{batch ? `${batch.summary.created_verified ?? 0} de ${batch.summary.total} verificadas` : `${selected.length} seleccionadas`}</strong>
-            <span>0 reintentos automáticos</span>
+            <strong>{batch ? `${batch.items.length} ${multiType ? "actividades listas para crear" : "Tasks listas para crear"}` : `${selected.length} seleccionadas`}</strong>
+            <span>{batch && !terminal ? "No se ha creado ninguna actividad en Jira." : ""}</span>
           </div>
           <button type="button" className="button ghost compact" aria-expanded={expanded} onClick={() => setExpanded((value) => !value)}>
             {expanded ? "Minimizar" : "Mostrar"}
@@ -1053,26 +1385,38 @@ export function Objective4C1Panel({
           {selectable.length > 5 && <p className="helper-text">Quedan {selectable.length} {multiType ? "actividades" : "Tasks"}; se seleccionaron las siguientes 5.</p>}
           {selectable.length === 0
             ? <div className="objective4a-warning"><strong>No quedan {multiType ? "actividades" : "Tasks"} disponibles</strong><span>Las elegibles ya fueron creadas, intentadas o reservadas por otro lote.</span></div>
-            : <div className="objective4a-actions"><button className="button primary" disabled={loading || selected.length < 1 || selected.length > 5} onClick={() => void prepare()}>{loading ? "Preparando…" : `Preparar lote de ${selected.length} ${multiType ? (selected.length === 1 ? "actividad" : "actividades") : (selected.length === 1 ? "Task" : "Tasks")}`}</button></div>}
+            : error
+              ? <div className="objective4a-actions"><button className="button secondary" disabled={loading || selected.length < 1 || selected.length > 5} onClick={() => void prepare()}>{loading ? "Preparando resumen…" : "Reintentar preparación del resumen"}</button></div>
+              : <div className="objective4a-warning" role="status"><strong>Preparando el resumen final…</strong><span>Este paso es automático y no crea nada en Jira.</span></div>}
         </>}
 
-        {batch?.status === "BATCH_PREPARED" && <section className="real-confirmation-card">
+        {batch && ["BATCH_PREPARED", "BATCH_CONFIRMED"].includes(batch.status) && authorizationExpired && <section className="real-confirmation-card expiry-card">
+          <span className="eyebrow">La verificación de seguridad venció</span>
+          <h4>Tus actividades siguen guardadas y no se creó nada en Jira.</h4>
+          <p>Por seguridad necesitamos verificar nuevamente la información antes de crear.</p>
+          <div className="objective4a-actions"><button className="button primary" disabled={loading} onClick={() => void revalidate()}>{loading ? "Verificando…" : "Verificar nuevamente"}</button></div>
+        </section>}
+
+        {batch?.status === "BATCH_PREPARED" && !authorizationExpired && <section className="real-confirmation-card">
           <span className="eyebrow">Confirmación final</span>
           <h4>Se crearán {batch.items.length} {multiType ? "actividades" : "Tasks"} reales en AT, en este orden</h4>
           <ol className="batch-items">
             {batch.items.map((item) => <li key={item.row_id}><strong>{item.preview.source_title}</strong><span>{item.preview.work_type} · {item.preview.assignee?.display_name} · {item.preview.parent_row_id ? `Padre ${item.preview.parent_issue_key ?? item.preview.parent_row_id} · ` : ""}{item.sprint_resolution?.selected?.name ?? "Sin Sprint"}</span><small>Nombre identificable: {item.preview.title}</small></li>)}
           </ol>
-          <p>Si una falla o no puede verificarse, las restantes no se intentarán. No hay rollback ni reintentos automáticos.</p>
-          <label>Escribe <strong>{batch.confirmation_phrase}</strong>
-            <input value={phrase} onChange={(event) => setPhrase(event.target.value)} aria-label="Frase de confirmación del lote" autoComplete="off" />
-          </label>
-          <details className="payload-details"><summary>Ver huellas técnicas del lote</summary><code>{JSON.stringify(batch.items.map((item) => ({ row_id: item.row_id, payload_hash: item.payload_hash, idempotency_key: item.idempotency_key })), null, 2)}</code><small>SHA-256 del lote: {batch.payload_hash}</small></details>
-          <div className="objective4a-actions"><button className="button primary danger" disabled={loading || phrase.trim().toUpperCase() !== batch.confirmation_phrase} onClick={() => void confirm()}>{loading ? "Confirmando…" : "Confirmar lote real"}</button></div>
+          <p>Si una actividad no puede crearse, el proceso se detendrá antes de continuar con las siguientes.</p>
+          <p className="helper-text">Verificación válida hasta {new Date(batch.confirmation.expires_at).toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" })}.</p>
+          <label className="confirmation-checkbox"><input type="checkbox" checked={reviewConfirmed} onChange={(event) => setReviewConfirmed(event.target.checked)} /> Confirmo que revisé estas actividades y deseo crearlas en Jira.</label>
+          <details className="payload-details"><summary>Detalles técnicos</summary><code>{JSON.stringify(batch.items.map((item) => ({ row_id: item.row_id, payload_hash: item.payload_hash, idempotency_key: item.idempotency_key })), null, 2)}</code><small>SHA-256 del lote: {batch.payload_hash}</small></details>
+          <div className="objective4a-actions"><button className="button primary danger" disabled={loading || !reviewConfirmed} onClick={() => setFinalModalOpen(true)}>{`Crear ${batch.items.length} ${multiType ? "actividades" : batch.items.length === 1 ? "Task" : "Tasks"} en Jira`}</button></div>
         </section>}
 
+        {finalModalOpen && batch?.status === "BATCH_PREPARED" && <div className="modal-backdrop" role="presentation"><section className="modal-card" role="dialog" aria-modal="true" aria-labelledby="final-create-title"><h4 id="final-create-title">Escribir actividades en Jira</h4><p>Se crearán {batch.items.length} actividades reales en el Space AT.</p><ul><li>{batch.items.length} actividades</li><li>{new Set(batch.items.map((item) => item.preview.assignee?.display_name)).size} responsables</li><li>Sprint seleccionado: {batch.items.map((item) => item.sprint_resolution?.selected?.name).filter(Boolean).join(", ") || "Sin Sprint"}</li></ul><p className="warning-text">Esta acción realizará escrituras reales en Jira.</p><div className="objective4a-actions"><button className="button secondary" disabled={loading} onClick={() => setFinalModalOpen(false)}>Cancelar</button><button className="button primary danger" disabled={loading} onClick={() => void confirmAndExecute()}>{loading ? "Escribiendo…" : "Escribir en Jira"}</button></div></section></div>}
+
         {batch?.status === "BATCH_CONFIRMED" && <section className="real-execute-card">
-          <div><span className="eyebrow">Autorización registrada</span><strong>La siguiente acción sí creará {batch.items.length} {multiType ? "actividades" : "Tasks"} en Jira</strong><p>Antes de escribir se revalidarán todos los Sprints. Después cada actividad se creará y comprobará por separado.</p></div>
-          <button className="button primary danger" disabled={loading} onClick={() => void execute()}>{loading ? "Creando y verificando…" : `Crear ${batch.items.length} ${multiType ? "actividades" : "Tasks"} reales en AT`}</button>
+          <div><span className="eyebrow">Confirmación registrada</span><strong>Listo para escribir en Jira</strong><p>Antes de crear se revalidarán los Sprints y cada actividad se comprobará por separado.</p></div>
+          <div className="objective4a-actions">
+            <button className="button primary danger" disabled={loading} onClick={() => void writeToJira()}>{loading ? "Escribiendo y verificando…" : "Escribir en Jira"}</button>
+          </div>
         </section>}
 
         {batch?.status === "BATCH_RUNNING" && <section className="real-write-pending" role="status"><div><strong>Lote en ejecución o pendiente de conciliación</strong><p>No vuelvas a enviarlo automáticamente. Revisa Jira por las claves y la evidencia registrada.</p></div></section>}
@@ -1107,11 +1451,13 @@ function Objective4APanel({
   proposal,
   dryRun,
   onNewProposal,
+  onBusyChange,
 }: {
   token: string;
   proposal: Proposal;
   dryRun: JiraDryRun;
   onNewProposal: () => void;
+  onBusyChange?: (busy: boolean) => void;
 }) {
   const eligible = dryRun.items.filter(
     (item) =>
@@ -1307,6 +1653,17 @@ function Objective4APanel({
       )
     : [];
 
+  const singleWriteBusy = intent?.status === "SUBMITTED"
+    || (loading && (intent?.status === "REAL_PREPARED" || intent?.status === "REAL_CONFIRMED"));
+
+  useEffect(() => {
+    if (!["CONTROLLED_BATCH", "CONTROLLED_MULTI_TYPE_BATCH", "CONTROLLED_HIERARCHY_BATCH"].includes(readiness?.policy?.mode ?? "")) {
+      onBusyChange?.(singleWriteBusy);
+    }
+  }, [onBusyChange, readiness?.policy?.mode, singleWriteBusy]);
+
+  useEffect(() => () => onBusyChange?.(false), [onBusyChange]);
+
   function readableValue(value: unknown): string {
     if (typeof value === "string") return value;
     if (typeof value === "number" || typeof value === "boolean") return String(value);
@@ -1319,7 +1676,7 @@ function Objective4APanel({
   }
 
   if (["CONTROLLED_BATCH", "CONTROLLED_MULTI_TYPE_BATCH", "CONTROLLED_HIERARCHY_BATCH"].includes(readiness?.policy?.mode ?? "")) {
-    return <Objective4C1Panel token={token} proposal={proposal} dryRun={dryRun} onNewProposal={onNewProposal} allowedWorkTypes={readiness?.policy?.allowed_work_types ?? ["Task"]} />;
+    return <Objective4C1Panel token={token} proposal={proposal} dryRun={dryRun} onNewProposal={onNewProposal} onBusyChange={onBusyChange} allowedWorkTypes={readiness?.policy?.allowed_work_types ?? ["Task"]} />;
   }
 
   return (
@@ -1551,34 +1908,6 @@ function Objective4APanel({
   );
 }
 
-const GENERAL_VALUE_FIELDS: Array<{
-  key: keyof Omit<ProposalDefaults, "space">;
-  label: string;
-}> = [
-  { key: "iniciativa", label: "Iniciativa" },
-  { key: "linea_trabajo", label: "L\u00ednea de trabajo" },
-  { key: "sprint", label: "Sprint" },
-  { key: "tipo_seguimiento", label: "Tipo de seguimiento" },
-  { key: "semaforo", label: "Sem\u00e1foro" },
-];
-
-function inferBusinessKey(name: string | null | undefined): keyof Omit<ProposalDefaults, "space"> | null {
-  const normalized = normalizeIdentity(name).replace(/_/g, " ");
-  const aliases: Record<string, keyof Omit<ProposalDefaults, "space">> = {
-    iniciativa: "iniciativa",
-    initiative: "iniciativa",
-    "linea de trabajo": "linea_trabajo",
-    "linea trabajo": "linea_trabajo",
-    workstream: "linea_trabajo",
-    sprint: "sprint",
-    "tipo de seguimiento": "tipo_seguimiento",
-    "tipo seguimiento": "tipo_seguimiento",
-    semaforo: "semaforo",
-    "traffic light": "semaforo",
-  };
-  return aliases[normalized] ?? null;
-}
-
 function GeneralValuesEditor({
   token,
   initial,
@@ -1598,14 +1927,20 @@ function GeneralValuesEditor({
   const [status, setStatus] = useState<AtlassianStatus | null>(null);
   const [sprints, setSprints] = useState<JiraSprint[]>([]);
   const [catalogError, setCatalogError] = useState("");
+  const [statusLoading, setStatusLoading] = useState(true);
+  const [sprintsLoading, setSprintsLoading] = useState(false);
+  const [connecting, setConnecting] = useState(false);
 
   useEffect(() => {
     let active = true;
+    setStatusLoading(true);
+    setCatalogError("");
     getAtlassianStatus(token)
       .then((result) => { if (active) setStatus(result); })
       .catch((reason) => {
         if (active) setCatalogError(reason instanceof Error ? reason.message : "No fue posible consultar los cat\u00e1logos de Jira.");
-      });
+      })
+      .finally(() => { if (active) setStatusLoading(false); });
     return () => { active = false; };
   }, [token]);
 
@@ -1613,8 +1948,10 @@ function GeneralValuesEditor({
     let active = true;
     if (!status?.connected) {
       setSprints([]);
+      setSprintsLoading(false);
       return () => { active = false; };
     }
+    setSprintsLoading(true);
     listJiraSprints(token, values.space, true)
       .then((result) => { if (active) setSprints(result); })
       .catch((reason) => {
@@ -1622,37 +1959,30 @@ function GeneralValuesEditor({
           setSprints([]);
           setCatalogError(reason instanceof Error ? reason.message : "No fue posible recuperar los Sprints de Jira.");
         }
-      });
+      })
+      .finally(() => { if (active) setSprintsLoading(false); });
     return () => { active = false; };
   }, [status?.connected, token, values.space]);
 
-  const catalogs = useMemo(() => {
-    const result = new Map<keyof Omit<ProposalDefaults, "space">, Array<{ value: string; label: string }>>();
-    const space = status?.snapshot?.spaces.find((candidate) => candidate.key === values.space);
-    for (const workType of space?.work_types ?? []) {
-      for (const field of workType.fields) {
-        const key = field.business_key ?? inferBusinessKey(field.name);
-        if (!key) continue;
-        const current = result.get(key) ?? [];
-        for (const option of field.options ?? []) {
-          if (!current.some((candidate) => normalizeIdentity(candidate.value) === normalizeIdentity(option.value))) {
-            current.push({ value: option.value, label: option.label });
-          }
-        }
-        result.set(key, current.sort((left, right) => left.label.localeCompare(right.label, "es")));
-      }
-    }
-    if (sprints.length > 0) {
-      result.set("sprint", sprints.map((sprint) => ({
-        value: sprint.name,
-        label: `${sprint.name} · ${sprint.state === "active" ? "Activo" : "Futuro"}`,
-      })));
-    }
-    return result;
-  }, [status, values.space, sprints]);
+  const catalogs = useMemo(
+    () => buildGeneralValueCatalogs(status, values.space, sprints),
+    [status, values.space, sprints],
+  );
 
   function updateValue(key: keyof ProposalDefaults, value: string) {
     setValues((current) => ({ ...current, [key]: value || null } as ProposalDefaults));
+  }
+
+  async function reconnectJira() {
+    setConnecting(true);
+    setCatalogError("");
+    try {
+      await connectAtlassianExternal(token);
+      setCatalogError("Se abrió Atlassian en el navegador predeterminado. Completa el consentimiento allí y vuelve a esta ventana.");
+    } catch (reason) {
+      setCatalogError(reason instanceof Error ? reason.message : "No fue posible iniciar la autorización de Jira.");
+      setConnecting(false);
+    }
   }
 
   return (
@@ -1667,7 +1997,27 @@ function GeneralValuesEditor({
         <p>{"Estos valores se aplicar\u00e1n a todas las actividades. El archivo original permanecer\u00e1 sin cambios para conservar la trazabilidad."}</p>
         {approved && (
           <div className="alert warning" role="status">
-            {"Esta propuesta est\u00e1 aprobada. Al guardar se crear\u00e1 una versi\u00f3n editable y deber\u00e1s aprobarla y validarla nuevamente con Jira."}
+            {"Esta propuesta ya fue validada. Al guardar se crear\u00e1 una versi\u00f3n editable y deber\u00e1s validarla nuevamente con Jira."}
+          </div>
+        )}
+        {statusLoading && (
+          <div className="alert info" role="status">Consultando los catálogos de Jira…</div>
+        )}
+        {!statusLoading && !status?.connected && (
+          <div className="jira-catalog-reconnect" role="status">
+            <div>
+              <strong>Conecta Jira para recuperar los menús desplegables</strong>
+              <p>{status?.error || "La aplicación necesita una conexión Atlassian activa para mostrar únicamente valores reales de Jira."}</p>
+            </div>
+            <button type="button" className="button secondary" disabled={connecting} onClick={() => void reconnectJira()}>
+              {connecting
+                ? "Abriendo Atlassian…"
+                : status?.phase === "ERROR"
+                  ? "Volver a autorizar Jira"
+                  : status?.phase === "AWAITING_USER_CONSENT"
+                    ? "Continuar autorización Jira"
+                    : "Conectar Jira"}
+            </button>
           </div>
         )}
         <label>
@@ -1684,46 +2034,51 @@ function GeneralValuesEditor({
             const currentValue = values[key] ?? "";
             const knownCurrent = options.some((option) => option.value === currentValue);
             const activeSprintCount = sprints.filter((sprint) => sprint.state === "active").length;
+            const fieldLoading = statusLoading || (key === "sprint" && sprintsLoading);
             return (
               <label key={key}>
                 {label}
-                {options.length > 0 ? (
-                  <select value={currentValue} onChange={(event) => updateValue(key, event.target.value)}>
-                    <option value="">
-                      {key === "sprint" && activeSprintCount > 1
-                        ? "Selecciona un Sprint (hay varios activos)"
-                        : key === "sprint" && activeSprintCount === 1
-                          ? "Automático: usar el único Sprint activo"
-                          : "Sin valor"}
-                    </option>
-                    {currentValue && !knownCurrent && <option value={currentValue}>{currentValue} · valor actual</option>}
-                    {options.map((option) => <option key={option.value} value={option.value}>{option.label}</option>)}
-                  </select>
-                ) : (
-                  <input
-                    value={currentValue}
-                    onChange={(event) => updateValue(key, event.target.value)}
-                    placeholder={key === "sprint" ? "Nombre exacto en Jira" : "Opcional"}
-                  />
-                )}
+                <select
+                  aria-label={label}
+                  value={currentValue}
+                  disabled={fieldLoading || !status?.connected || options.length === 0}
+                  aria-busy={fieldLoading}
+                  onChange={(event) => updateValue(key, event.target.value)}
+                >
+                  <option value="">
+                    {fieldLoading
+                      ? "Cargando opciones de Jira…"
+                      : !status?.connected
+                        ? "Conecta Jira para cargar opciones"
+                        : options.length === 0
+                          ? "Jira no publicó opciones para este campo"
+                          : key === "sprint" && activeSprintCount > 1
+                            ? "Selecciona un Sprint (hay varios activos)"
+                            : key === "sprint" && activeSprintCount === 1
+                              ? "Automático: usar el único Sprint activo"
+                              : "Sin valor"}
+                  </option>
+                  {currentValue && !knownCurrent && <option value={currentValue}>{currentValue} · valor actual</option>}
+                  {options.map((option) => <option key={option.value} value={option.value}>{option.label}</option>)}
+                </select>
                 <small className={options.length > 0 ? "catalog-status live" : "catalog-status"}>
                   {options.length > 0
                     ? `${options.length} ${options.length === 1 ? "opci\u00f3n recuperada" : "opciones recuperadas"} de Jira`
                     : key === "sprint" && status?.connected
-                      ? "No se recuperaron Sprints con actividades visibles. Puedes escribir el nombre; se resolverá y validará antes de cualquier envío."
+                      ? "Jira no devolvió Sprints activos o futuros para este Space."
                     : status?.connected
-                      ? "Jira no public\u00f3 un cat\u00e1logo para este campo; se permite captura manual."
-                      : "Conecta Jira para consultar opciones; por ahora se permite captura manual."}
+                      ? "Jira no public\u00f3 opciones para este campo."
+                      : "Conecta Jira para consultar y seleccionar valores reales."}
                 </small>
               </label>
             );
           })}
         </div>
-        {catalogError && <div className="alert warning">{catalogError} Puedes continuar con captura manual.</div>}
+        {catalogError && <div className="alert warning">{catalogError}</div>}
         <div className="drawer-actions">
           <button type="button" className="button secondary" onClick={onClose}>Cancelar</button>
-          <button type="submit" className="button primary" disabled={saving}>
-            {saving ? "Guardando nueva versi\u00f3n\u2026" : "Guardar como nueva versi\u00f3n"}
+          <button type="submit" className="button primary" disabled={saving || statusLoading || !status?.connected || connecting}>
+            {saving ? "Guardando nueva versi\u00f3n\u2026" : !status?.connected ? "Conecta Jira para guardar" : "Guardar como nueva versi\u00f3n"}
           </button>
         </div>
       </form>
@@ -1755,14 +2110,16 @@ export function ProposalReview({
   const [selected, setSelected] = useState<ProposalItem | null>(null);
   const [error, setError] = useState("");
   const [success, setSuccess] = useState("");
-  const [approvalOpen, setApprovalOpen] = useState(false);
-  const [approvalConfirmed, setApprovalConfirmed] = useState(false);
   const [processingLifecycle, setProcessingLifecycle] = useState(false);
   const [dryRun, setDryRun] = useState<JiraDryRun | null>(null);
   const [dryRunLoading, setDryRunLoading] = useState(false);
   const [continueCorrections, setContinueCorrections] = useState(false);
   const [defaultsOpen, setDefaultsOpen] = useState(false);
   const [defaultsSaving, setDefaultsSaving] = useState(false);
+  const [executionBusy, setExecutionBusy] = useState(false);
+  const [bulkTrackingValue, setBulkTrackingValue] = useState("");
+  const [bulkTrackingSaving, setBulkTrackingSaving] = useState(false);
+  const [excludingPending, setExcludingPending] = useState(false);
   const approved = proposal.status === "APPROVED";
   const currentDryRun = dryRun
     && !dryRun.stale
@@ -1867,6 +2224,9 @@ export function ProposalReview({
         setSuccess(`Versión ${updated.version} guardada. Comprobaremos la corrección y abriremos la siguiente actividad pendiente.`);
         setContinueCorrections(true);
         setTab("JIRA_ACTION");
+        // The previous dry-run remains available as historical evidence, but is
+        // no longer shown as an active blocker for the newly versioned proposal.
+        setDryRun(null);
       } else if (updatedItem?.generated.decision === "INCLUIR") {
         setSuccess(
           `Versión ${updated.version} guardada. Se resolvieron todos los pendientes y la actividad pasó a Listas.`,
@@ -1886,6 +2246,7 @@ export function ProposalReview({
       setSelected(null);
     } catch (reason) {
       setError(reason instanceof Error ? reason.message : "No fue posible guardar.");
+      throw reason;
     }
   }
 
@@ -1917,32 +2278,46 @@ export function ProposalReview({
       const result = await approveProposalAndDryRun(token, proposal.proposal_id);
       onUpdated(result.proposal);
       setDryRun(result.dry_run);
-      setApprovalOpen(false);
-      setApprovalConfirmed(false);
       setSuccess(
         result.dry_run.status === "BLOCKED"
-          ? `La versión ${result.proposal.version} se aprobó, pero la prevalidación detectó ${result.dry_run.summary.blocked} bloqueos que deben corregirse.`
+          ? `La validación de la versión ${result.proposal.version} detectó ${result.dry_run.summary.blocked} bloqueos que deben corregirse.`
           : `Validación con Jira completada para la versión ${result.proposal.version}, sin crear ni modificar actividades.`,
       );
     } catch (reason) {
-      setError(reason instanceof Error ? reason.message : "No fue posible aprobar.");
+      setError(reason instanceof Error ? reason.message : "No fue posible validar la propuesta.");
     } finally {
       setProcessingLifecycle(false);
     }
   }
 
-  async function reopen() {
+  async function reopen(): Promise<Proposal | null> {
     setProcessingLifecycle(true);
     setError("");
     try {
       const updated = await reopenProposal(token, proposal.proposal_id);
       onUpdated(updated);
-      setSuccess(`Versión ${updated.version} reabierta. La aprobación anterior se conserva en el historial.`);
+      setDryRun(null);
+      setSuccess(
+        `Versión ${updated.version} abierta para edición. La validación anterior se conservó en el historial, pero ya no autoriza ninguna creación.`,
+      );
+      return updated;
     } catch (reason) {
       setError(reason instanceof Error ? reason.message : "No fue posible reabrir.");
+      return null;
     } finally {
       setProcessingLifecycle(false);
     }
+  }
+
+  async function editProposal() {
+    if (processingLifecycle || dryRunLoading || executionBusy) return;
+    if (approved) {
+      const reopened = await reopen();
+      if (!reopened) return;
+    }
+    window.setTimeout(() => {
+      document.getElementById("proposal-activities")?.scrollIntoView({ behavior: "smooth", block: "start" });
+    }, 0);
   }
 
   async function runDryRun() {
@@ -1956,11 +2331,30 @@ export function ProposalReview({
         result.status === "READY"
           ? `Validación lista: ${result.summary.ready} actividades comprobadas sin escribir en Jira.`
           : result.status === "READY_WITH_WARNINGS"
-            ? `Prevalidación completada con ${result.summary.ready_with_warnings ?? 0} advertencias técnicas no bloqueantes para esta fase sin escritura.`
+            ? `Validación completada con ${result.summary.ready_with_warnings ?? 0} advertencias técnicas no bloqueantes y sin escrituras en Jira.`
           : `Validación bloqueada: corrige ${result.summary.blocked} actividades antes de continuar.`,
       );
     } catch (reason) {
       setError(reason instanceof Error ? reason.message : "No fue posible ejecutar la validación con Jira.");
+    } finally {
+      setDryRunLoading(false);
+    }
+  }
+
+  async function runReadOnlyPreflight() {
+    setDryRunLoading(true);
+    setError("");
+    setSuccess("");
+    try {
+      const result = await preflightProposal(token, proposal.proposal_id) as JiraDryRun;
+      setDryRun(result);
+      setSuccess(
+        result.status === "READY" || result.status === "READY_WITH_WARNINGS"
+          ? "Comprobación con Jira completada en modo lectura. No se creó ninguna actividad."
+          : `Comprobación con Jira completada: ${result.summary.blocked} actividades requieren corrección.`,
+      );
+    } catch (reason) {
+      setError(reason instanceof Error ? reason.message : "No fue posible comprobar la propuesta con Jira.");
     } finally {
       setDryRunLoading(false);
     }
@@ -1980,7 +2374,7 @@ export function ProposalReview({
       setDefaultsOpen(false);
       setSuccess(
         `Versi\u00f3n ${updated.version} creada con los valores generales actualizados. `
-        + "La versi\u00f3n anterior se conserva y deber\u00e1s repetir la aprobaci\u00f3n y la validaci\u00f3n con Jira.",
+        + "La versi\u00f3n anterior se conserva y deber\u00e1s repetir la validaci\u00f3n con Jira.",
       );
     } catch (reason) {
       setError(reason instanceof Error ? reason.message : "No fue posible actualizar los valores generales.");
@@ -1989,10 +2383,56 @@ export function ProposalReview({
     }
   }
 
+  async function applyTrackingToAll() {
+    if (!bulkTrackingValue || bulkTrackingSaving) return;
+    const activeRows = proposal.items.filter((item) => item.generated.decision !== "EXCLUIR");
+    if (!window.confirm(`Se actualizarán ${activeRows.length} actividades localmente. No se modificará Jira.`)) return;
+    setBulkTrackingSaving(true);
+    setError("");
+    try {
+      const updated = await bulkUpdateProposal(token, proposal.proposal_id, "tipo_seguimiento", bulkTrackingValue,
+        activeRows.map((item) => item.generated.row_id));
+      onUpdated(updated);
+      setSuccess(`Tipo de seguimiento aplicado a ${activeRows.length} actividades. Vuelve a verificar con Jira.`);
+      setBulkTrackingValue("");
+    } catch (reason) {
+      setError(reason instanceof Error ? reason.message : "No fue posible aplicar el valor a las actividades.");
+    } finally { setBulkTrackingSaving(false); }
+  }
+
+  async function excludePendingItems() {
+    const pending = proposal.items.filter((item) => item.generated.decision === "REVISAR");
+    if (pending.length === 0 || excludingPending) return;
+    if (!window.confirm(
+      `Se excluirán ${pending.length} ${pending.length === 1 ? "actividad pendiente" : "actividades pendientes"} de esta propuesta. No se modificará Jira.`,
+    )) return;
+    setExcludingPending(true);
+    setError("");
+    setSuccess("");
+    try {
+      const updated = await excludeProposalItems(
+        token,
+        proposal.proposal_id,
+        pending.map((item) => item.generated.row_id),
+        "Excluida por decisión del usuario para crear únicamente las actividades seleccionadas.",
+      );
+      onUpdated(updated);
+      setTab("INCLUIR");
+      setDryRun(null);
+      setSuccess(
+        `${pending.length} ${pending.length === 1 ? "actividad pendiente fue excluida" : "actividades pendientes fueron excluidas"} localmente. Comprueba con Jira las actividades listas.`,
+      );
+    } catch (reason) {
+      setError(reason instanceof Error ? reason.message : "No fue posible excluir las actividades pendientes.");
+    } finally {
+      setExcludingPending(false);
+    }
+  }
+
   const visibleTabs: Array<[ProposalTab, string]> = correctionMode
     ? [
         ["JIRA_ACTION", "Por corregir"],
-        ["JIRA_TECHNICAL", "Validación técnica"],
+        ["JIRA_TECHNICAL", "Comprobación automática"],
         ["JIRA_CORRECTED", "Corregidas"],
         ["TODAS", "Todas"],
       ]
@@ -2013,38 +2453,40 @@ export function ProposalReview({
   }
 
   return (
-    <section className="proposal-card">
-      <ProposalHeader proposal={proposal} displayName={displayName} onRename={onRename} />
+    <section data-tour-id="proposal-review" className="proposal-card">
+      <ProposalHeader
+        proposal={proposal}
+        displayName={displayName}
+        onRename={onRename}
+        onEdit={() => void editProposal()}
+        editDisabled={processingLifecycle || dryRunLoading || executionBusy}
+      />
       <nav className="workflow-guide" aria-label="Progreso de la propuesta">
-        <div className={!approved ? "active" : "complete"}>
-          <span>1</span><strong>Revisar actividades</strong><small>Corrige sólo los pendientes</small>
-        </div>
-        <div className={approved && !currentDryRun ? "active" : currentDryRun ? "complete" : ""}>
-          <span>2</span><strong>Validar con Jira</strong><small>Comprueba datos sin escribir</small>
+        <div className={approved && currentDryRun?.status !== "BLOCKED" ? "complete" : "active"}>
+          <span>1</span><strong>Comprobar en Jira</strong><small>Revisa datos y corrige los pendientes</small>
         </div>
         <div className={approved && currentDryRun?.status !== "BLOCKED" ? "active" : ""}>
-          <span>3</span><strong>Probar y enviar</strong><small>Simula antes de crear una Task</small>
+          <span>2</span><strong>Revisar y crear</strong><small>Confirma el resumen antes de crear</small>
         </div>
       </nav>
       {approved ? (
         <section className={`approval-banner ${currentDryRun?.status === "BLOCKED" ? "correction-state" : "approved-state"}`}>
           <div>
             <span className="eyebrow">{currentDryRun && currentDryRun.status !== "BLOCKED" ? "Validación con Jira completada" : currentDryRun ? "Correcciones Jira pendientes" : "Validación con Jira pendiente"}</span>
-            <strong>{currentDryRun?.status === "READY_WITH_WARNINGS" ? "Prevalidación completada con advertencias técnicas" : currentDryRun?.status === "READY" ? "Prevalidación completada" : currentDryRun?.status === "BLOCKED" ? `${currentDryRun.summary.blocked} ${currentDryRun.summary.blocked === 1 ? "actividad requiere" : "actividades requieren"} corrección` : "Versión aprobada; falta comprobarla contra Jira"}</strong>
-            <p>{currentDryRun?.status === "READY_WITH_WARNINGS" ? "Las cuentas Jira fueron identificadas. La asignabilidad estricta se comprobará antes de autorizar cualquier escritura real." : currentDryRun?.status === "READY" ? "La propuesta y los metadatos Jira quedaron prevalidados. No se realizó ninguna escritura." : currentDryRun?.status === "BLOCKED" ? "Reabre la propuesta y corrige únicamente las actividades bloqueadas; después la aprobación repetirá la prevalidación automáticamente." : dryRun ? `El resultado visible corresponde a la versión ${dryRun.proposal_version}; ejecuta la comprobación de la versión ${proposal.version}.` : `Aprobada por ${proposal.approved_by} · ${proposal.approved_at}`}</p>
+            <strong>{currentDryRun?.status === "READY_WITH_WARNINGS" ? `${count("INCLUIR")} ${count("INCLUIR") === 1 ? "actividad lista" : "actividades listas"} con advertencias` : currentDryRun?.status === "READY" ? `${count("INCLUIR")} ${count("INCLUIR") === 1 ? "actividad lista" : "actividades listas"} para confirmar y crear` : currentDryRun?.status === "BLOCKED" ? `${currentDryRun.summary.blocked} ${currentDryRun.summary.blocked === 1 ? "actividad requiere" : "actividades requieren"} corrección` : "La propuesta debe validarse con Jira"}</strong>
+            <p>{currentDryRun?.status === "READY_WITH_WARNINGS" ? "Revisa las advertencias en el resumen final. Todavía no se ha creado ninguna actividad." : currentDryRun?.status === "READY" ? "Los datos y metadatos quedaron comprobados. Todavía no se ha creado ninguna actividad." : currentDryRun?.status === "BLOCKED" ? "Edita únicamente las actividades bloqueadas y vuelve a validar con Jira." : dryRun ? `La validación visible corresponde a la versión ${dryRun.proposal_version}; valida la versión actual ${proposal.version}.` : `Versión preparada por ${proposal.approved_by} · ${proposal.approved_at}`}</p>
           </div>
           <div className="approval-actions">
-            {currentDryRun?.status === "BLOCKED" && <button className="button primary" disabled={processingLifecycle} onClick={() => void reopen()}>Reabrir y resolver bloqueos</button>}
-            {!currentDryRun && <button className="button primary" disabled={dryRunLoading} onClick={() => void runDryRun()}>{dryRunLoading ? "Prevalidando…" : "Ejecutar prevalidación final"}</button>}
-            {currentDryRun && <button className="button secondary" disabled={dryRunLoading} onClick={() => void runDryRun()}>{dryRunLoading ? "Prevalidando…" : "Repetir prevalidación"}</button>}
+            {currentDryRun?.status === "BLOCKED" && <button className="button primary" disabled={processingLifecycle} onClick={() => void editProposal()}>Editar y resolver bloqueos</button>}
+            {!currentDryRun && <button className="button primary" disabled={dryRunLoading} onClick={() => void runDryRun()}>{dryRunLoading ? "Comprobando en Jira…" : "Comprobar en Jira"}</button>}
+            {currentDryRun && <button className="button secondary" disabled={dryRunLoading || executionBusy} onClick={() => void runDryRun()}>{dryRunLoading ? "Comprobando en Jira…" : "Comprobar nuevamente"}</button>}
             {currentDryRun && <button className="button secondary" onClick={() => void downloadDryRunEvidence(token, proposal.proposal_id, displayName)}>Descargar evidencia JSON</button>}
-            {currentDryRun?.status !== "BLOCKED" && <button className="button secondary" disabled={processingLifecycle} onClick={() => void reopen()}>Reabrir para editar</button>}
           </div>
         </section>
       ) : correctionMode && (correctionWorkflow?.summary.pending_user ?? 0) > 0 ? (
         <section className="approval-banner correction-state">
           <div>
-            <span className="eyebrow">Corrección previa a la aprobación</span>
+            <span className="eyebrow">Corrección previa a la validación</span>
             <strong>{correctionWorkflow?.summary.pending_user} {correctionWorkflow?.summary.pending_user === 1 ? "actividad requiere" : "actividades requieren"} una corrección</strong>
             <p>{correctionWorkflow?.summary.technical ?? 0} {(correctionWorkflow?.summary.technical ?? 0) === 1 ? "validación técnica no requiere" : "validaciones técnicas no requieren"} que modifiques datos. Te guiaremos actividad por actividad.</p>
           </div>
@@ -2053,43 +2495,59 @@ export function ProposalReview({
       ) : correctionMode ? (
         <section className="approval-banner ready-state">
           <div>
-            <span className="eyebrow">Correcciones de usuario completadas</span>
-            <strong>Ya puedes revisar y aprobar las correcciones</strong>
-            <p>{correctionWorkflow?.summary.technical ?? 0} {(correctionWorkflow?.summary.technical ?? 0) === 1 ? "validación técnica se repetirá" : "validaciones técnicas se repetirán"} en la comprobación final. Aún no se escribirá nada en Jira.</p>
+            <span className="eyebrow">Propuesta lista para validar</span>
+            <strong>Las correcciones necesarias están completas</strong>
+            <p>{correctionWorkflow?.summary.technical ?? 0} {(correctionWorkflow?.summary.technical ?? 0) === 1 ? "comprobación técnica se repetirá" : "comprobaciones técnicas se repetirán"} al validar con Jira. No se creará ninguna actividad.</p>
           </div>
-          <button className="button primary" onClick={() => setApprovalOpen(true)}>Revisar y aprobar correcciones</button>
+          <button className="button primary" disabled={processingLifecycle} onClick={() => void approve()}>{processingLifecycle ? "Comprobando en Jira…" : "Comprobar en Jira"}</button>
         </section>
       ) : count("REVISAR") === 0 ? (
         <section className="approval-banner ready-state">
           <div>
-            <span className="eyebrow">Lista para aprobación</span>
+            <span className="eyebrow">Propuesta lista para validar</span>
             <strong>Ya no hay actividades pendientes</strong>
-            <p>Revisa el resumen y aprueba la propuesta final. Aún no se escribirá nada en Jira.</p>
+            <p>Comprueba la propuesta con Jira. Esta acción no creará ninguna actividad.</p>
           </div>
-          <button className="button primary" onClick={() => setApprovalOpen(true)}>Revisar y aprobar propuesta final</button>
+          <button className="button primary" disabled={processingLifecycle} onClick={() => void approve()}>{processingLifecycle ? "Comprobando en Jira…" : "Comprobar en Jira"}</button>
         </section>
       ) : (
         <section className="approval-banner pending-state">
           <div>
             <span className="eyebrow">Preparación de la propuesta</span>
             <strong>{count("REVISAR")} {count("REVISAR") === 1 ? "actividad pendiente" : "actividades pendientes"}</strong>
-            <p>Resuelve todas las revisiones antes de habilitar la aprobación final.</p>
+            <p>Resuelve todas las revisiones antes de validar la propuesta con Jira.</p>
+          </div>
+          <div className="approval-actions">
+            <button className="button secondary" disabled={dryRunLoading || excludingPending} onClick={() => void runReadOnlyPreflight()}>
+              {dryRunLoading ? "Comprobando en Jira…" : "Comprobar con Jira"}
+            </button>
+            {count("INCLUIR") > 0 && (
+              <button className="button secondary" disabled={dryRunLoading || excludingPending} onClick={() => void excludePendingItems()}>
+                {excludingPending ? "Excluyendo pendientes…" : "Excluir pendientes y continuar"}
+              </button>
+            )}
           </div>
         </section>
       )}
       {dryRun && (
         <details className="dry-run-history">
           <summary>
-            <span>Resultado de la validación con Jira</span>
+            <span>Resultado de la comprobación en Jira</span>
             <small>Versión {dryRun.proposal_version} · {dryRun.status === "BLOCKED" ? `${dryRun.summary.blocked} bloqueadas` : "sin bloqueos"}</small>
           </summary>
           <DryRunPanel dryRun={dryRun} currentProposalVersion={proposal.version} />
         </details>
       )}
       {approved && currentDryRun && currentDryRun.status !== "BLOCKED" && (
-        <Objective4APanel token={token} proposal={proposal} dryRun={currentDryRun} onNewProposal={onNewProposal} />
+        <Objective4APanel
+          token={token}
+          proposal={proposal}
+          dryRun={currentDryRun}
+          onNewProposal={onNewProposal}
+          onBusyChange={setExecutionBusy}
+        />
       )}
-      <details className="workflow-section activities-section" open={!approved || correctionMode}>
+      <details id="proposal-activities" className="workflow-section activities-section" open={!approved || correctionMode}>
         <summary>
           <span>Actividades de la propuesta</span>
           <small>{proposal.items.length} actividades · {count("REVISAR")} por revisar</small>
@@ -2106,6 +2564,18 @@ export function ProposalReview({
           Editar valores
         </button>
       </div>
+      {dryRun && dryRun.status === "BLOCKED" && (() => {
+        const options = dryRun.items.flatMap((item) => item.errors.find((issue) => issue.field === "tipo_seguimiento")?.options ?? []);
+        const unique = Array.from(new Map(options.map((option) => [option.value, option])).values());
+        return unique.length > 0 ? <section className="bulk-correction" aria-label="Aplicar tipo de seguimiento a varias actividades">
+          <div><strong>Aplicar Tipo de seguimiento a todas</strong><small>Decisión local; Jira se volverá a consultar después.</small></div>
+          <select aria-label="Tipo de seguimiento para aplicar a todas" value={bulkTrackingValue} onChange={(event) => setBulkTrackingValue(event.target.value)}>
+            <option value="">Selecciona un valor vigente de Jira</option>
+            {unique.map((option) => <option key={option.value} value={option.value}>{option.value}</option>)}
+          </select>
+          <button type="button" className="button secondary" disabled={!bulkTrackingValue || bulkTrackingSaving} onClick={() => void applyTrackingToAll()}>{bulkTrackingSaving ? "Aplicando…" : `Aplicar a ${proposal.items.filter((item) => item.generated.decision !== "EXCLUIR").length}`}</button>
+        </section> : null;
+      })()}
       <div className="review-toolbar">
         <div className="tabs" role="tablist" aria-label="Decisiones">
           {visibleTabs.map(([value, label]) => (
@@ -2166,7 +2636,7 @@ export function ProposalReview({
                   {correctionByRow.get(item.generated.row_id)?.category === "USER_ACTION"
                     ? "Por corregir"
                     : correctionByRow.get(item.generated.row_id)?.category === "TECHNICAL"
-                      ? "Validación técnica"
+                      ? "Comprobación automática"
                       : "Corrección guardada"}
                 </span>
               ) : (
@@ -2194,6 +2664,7 @@ export function ProposalReview({
           token={token}
           item={selected}
           proposalItems={proposal.items}
+          isMinutesProposal={Boolean(proposal.minutes)}
           onClose={() => setSelected(null)}
           onSave={save}
           onReactivate={reactivate}
@@ -2211,30 +2682,6 @@ export function ProposalReview({
           onSave={saveDefaults}
         />
       )}
-      {approvalOpen && (
-        <div className="modal-backdrop" role="presentation" onMouseDown={() => setApprovalOpen(false)}>
-          <section className="approval-modal" role="dialog" aria-modal="true" aria-labelledby="approval-title" onMouseDown={(event) => event.stopPropagation()}>
-            <span className="eyebrow">Confirmación final</span>
-            <h2 id="approval-title">Aprobar {displayName}</h2>
-            <p>Se aprobará la versión y, en el mismo paso, se ejecutará la prevalidación final contra Jira. No se escribirá ninguna actividad.</p>
-            <dl className="approval-summary">
-              <div><dt>Listas para Jira</dt><dd>{count("INCLUIR")}</dd></div>
-              <div><dt>Excluidas</dt><dd>{count("EXCLUIR")}</dd></div>
-              <div><dt>Archivo fuente</dt><dd>{proposal.source_file.name}</dd></div>
-              <div><dt>Huella SHA-256</dt><dd>{proposal.source_file.sha256}</dd></div>
-            </dl>
-            <label className="confirmation-row">
-              <input type="checkbox" checked={approvalConfirmed} onChange={(event) => setApprovalConfirmed(event.target.checked)} />
-              Revisé las actividades incluidas y excluidas y confirmo esta propuesta final.
-            </label>
-            <div className="drawer-actions">
-              <button className="button secondary" onClick={() => setApprovalOpen(false)}>Cancelar</button>
-              <button className="button primary" disabled={!approvalConfirmed || processingLifecycle} onClick={() => void approve()}>{processingLifecycle ? "Aprobando y prevalidando…" : "Aprobar y ejecutar prevalidación final"}</button>
-            </div>
-            <p className="jira-future-note">La creación en Jira seguirá bloqueada hasta autorizar expresamente el paso de envío controlado.</p>
-          </section>
-        </div>
-      )}
     </section>
   );
 }
@@ -2249,6 +2696,7 @@ export function AtlassianConnectionPanel({
   const [status, setStatus] = useState<AtlassianStatus | null>(null);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState("");
+  const [oauthNotice, setOauthNotice] = useState("");
   const [lookupSpace, setLookupSpace] = useState<Space>("AT");
   const [lookupQuery, setLookupQuery] = useState("");
   const [assignees, setAssignees] = useState<JiraAssignee[]>([]);
@@ -2262,7 +2710,7 @@ export function AtlassianConnectionPanel({
       const nextStatus = await getAtlassianStatus(token);
       setStatus(nextStatus);
       onStatusChange?.(nextStatus);
-      if (nextStatus.error) setError(nextStatus.error);
+      if (nextStatus.error && !nextStatus.diagnostic) setError(nextStatus.error);
       if (nextStatus.connected) {
         const readiness = await getObjective4AReadiness(token);
         if (readiness?.objective === "4A") setObjective4AReadiness(readiness);
@@ -2283,29 +2731,60 @@ export function AtlassianConnectionPanel({
       window.history.replaceState({}, "", window.location.pathname);
       if (result === "denied") setError("La autorización de Atlassian fue cancelada.");
     }
-    void loadStatus();
+    void loadStatus().then(() => {
+      const callbackMessages: Record<string, string> = {
+        denied: 'La autorización de Atlassian fue cancelada.',
+        OAUTH_CALLBACK_INVALID: 'La respuesta de autorización está incompleta. Intenta conectar de nuevo.',
+        OAUTH_STATE_INVALID: 'El estado de la autorización no existe o ya venció. Intenta conectar de nuevo.',
+      };
+      if (result && callbackMessages[result]) setError(callbackMessages[result]);
+    });
   }, [token]);
+
+  useEffect(() => {
+    if (status?.diagnostic?.state !== 'OAUTH_IN_PROGRESS') return;
+    const timer = window.setTimeout(() => void loadStatus(), 3000);
+    return () => window.clearTimeout(timer);
+  }, [status, token]);
+
+  async function checkConnection() {
+    setLoading(true);
+    setError('');
+    try {
+      const next = await diagnoseAtlassian(token);
+      setStatus(next);
+      onStatusChange?.(next);
+    } catch {
+      setStatus(null);
+      setError('No fue posible comprobar el backend local. Revisa que esté activo y vuelve a intentarlo.');
+    } finally { setLoading(false); }
+  }
 
   async function connect() {
     setLoading(true);
     setError("");
+    setOauthNotice("");
     try {
-      const response = await connectAtlassian(token);
-      window.location.assign(response.authorization_url);
+      await connectAtlassianExternal(token);
+      setOauthNotice("Se abrió Atlassian en el navegador predeterminado. Completa el consentimiento allí; esta pantalla detectará el regreso automáticamente.");
+      // OAuth is handled by the system browser. Keep this app open so the
+      // diagnostic poller can observe the loopback callback.
+      await loadStatus();
     } catch (reason) {
+      setOauthNotice("");
       setError(reason instanceof Error ? reason.message : "No fue posible iniciar OAuth.");
       setLoading(false);
+      void loadStatus();
     }
   }
 
   async function disconnect() {
-    if (!window.confirm("¿Desconectar tu cuenta Atlassian? Se eliminará la autorización cifrada guardada en este equipo.")) return;
+    if (!window.confirm("¿Desvincular tu cuenta Atlassian? Se eliminará la autorización cifrada guardada en este equipo.")) return;
     setLoading(true);
     setError("");
     try {
-      const nextStatus = await disconnectAtlassian(token);
-      setStatus(nextStatus);
-      onStatusChange?.(nextStatus);
+      await unlinkAtlassian();
+      await loadStatus();
       setObjective4AReadiness(null);
       setAssignees([]);
     } catch (reason) {
@@ -2325,6 +2804,21 @@ export function AtlassianConnectionPanel({
       if (nextStatus.connected) setObjective4AReadiness(await getObjective4AReadiness(token));
     } catch (reason) {
       setError(reason instanceof Error ? reason.message : "No fue posible actualizar el diagnóstico.");
+    } finally {
+      setLoading(false);
+    }
+  }
+
+  async function changeGlobalWriteLock(action: 'unlock' | 'lock') {
+    setLoading(true);
+    setError("");
+    try {
+      const nextLock = action === 'unlock' ? await unlockJiraWrites(token) : await lockJiraWrites(token);
+      const nextStatus = await getAtlassianStatus(token);
+      setStatus({ ...nextStatus, global_write_lock: nextLock });
+      onStatusChange?.({ ...nextStatus, global_write_lock: nextLock });
+    } catch (reason) {
+      setError(reason instanceof Error ? reason.message : "No fue posible cambiar el bloqueo global.");
     } finally {
       setLoading(false);
     }
@@ -2358,132 +2852,112 @@ export function AtlassianConnectionPanel({
   }
 
   const snapshot = status?.snapshot;
+  const account = snapshot?.atlassian_user;
+  const connected = Boolean(status?.connected);
+  const readAvailable = connected && Boolean(snapshot?.read_tools_available?.length);
+  const writeAvailable = connected && Boolean(status?.jira_write_enabled) && status?.global_write_lock?.locked !== true;
+  const connectionLabel = loading
+    ? "Comprobando…"
+    : connected
+      ? "Jira conectado"
+      : status?.diagnostic?.state === "OAUTH_EXPIRED" || status?.diagnostic?.state === "OAUTH_INVALID"
+        ? "Requiere atención"
+        : "Jira desconectado";
   return (
-    <section className={`integration-card ${status?.connected ? "connected" : ""}`}>
+    <section className={`integration-card jira-settings-card ${connected ? "connected" : ""}`}>
       <div className="integration-heading">
         <div>
           <span className="eyebrow">Configuración de Jira</span>
-          <h2>Conexión de la aplicación con Jira</h2>
-          <p>
-            OAuth 2.1 por usuario · consulta de metadatos · {status?.jira_write_enabled ? "una Task controlada habilitada" : "escritura Jira bloqueada"}.
-          </p>
+          <h2>Cuenta Atlassian y Jira</h2>
+          <p>{connected ? "Tu cuenta está lista para trabajar con Jira." : "Conecta tu cuenta para consultar tus espacios y preparar actividades."}</p>
         </div>
-        <span className={`connection-pill ${status?.connected ? "online" : "offline"}`}>
-          {loading ? "Consultando…" : status?.connected ? status.jira_write_enabled ? "Conectado · envío controlado" : "Conectado · solo lectura" : "Desconectado"}
+        <span className={`connection-pill ${connected ? "online" : "offline"}`}>
+          {connected && <Icon name="check" />}{connectionLabel}
         </span>
       </div>
 
       {error && <div className="alert error" role="alert">{error}</div>}
+      {oauthNotice && <div className="alert info" role="status">{oauthNotice}</div>}
+
+      {status?.diagnostic?.state === 'JIRA_READY' && !status.connected && <button className="button primary" disabled={loading} onClick={() => void refresh()}>Restaurar conexión con la autorización guardada</button>}
+      {!status && !loading && <button className="button secondary" onClick={() => void loadStatus()}>Reintentar</button>}
+      {status?.connected && status.diagnostic?.state.startsWith('OAUTH_') && <button className="button primary" disabled={loading} onClick={() => void connect()}>Reconectar cuenta</button>}
 
       {!status?.connected ? (
-        <div className="integration-onboarding">
-          <div className="read-only-seal">
-            <strong>Protección activa</strong>
-            <span>El backend rechaza cualquier herramienta MCP fuera de la lista de lectura.</span>
+        <>
+          <div className="integration-onboarding">
+            <div className="read-only-seal">
+              <strong>Protección activa</strong>
+              <span>Las pruebas de conexión sólo consultan información de Atlassian.</span>
+            </div>
+            <div className="integration-actions horizontal">
+              {!status?.diagnostic && status?.phase === "ERROR" && (
+                <button className="button secondary" onClick={() => void refresh()} disabled={loading}>
+                  Reintentar diagnóstico
+                </button>
+              )}
+              {status?.diagnostic?.state !== 'JIRA_READY' && <button className="button primary" onClick={() => void connect()} disabled={loading}>
+                {status?.diagnostic?.state === 'OAUTH_IN_PROGRESS' || status?.diagnostic?.state === 'OAUTH_CANCELLED' || status?.diagnostic?.state === 'OAUTH_TIMEOUT' ? 'Intentar de nuevo' : status?.phase === "ERROR" || ['OAUTH_EXPIRED', 'OAUTH_INVALID'].includes(status?.diagnostic?.state || '') ? "Reconectar cuenta" : "Conectar mi cuenta Atlassian"}
+              </button>}
+            </div>
           </div>
-          <div className="integration-actions horizontal">
-            {status?.phase === "ERROR" && (
-              <button className="button secondary" onClick={() => void refresh()} disabled={loading}>
-                Reintentar diagnóstico
-              </button>
-            )}
-            <button className="button primary" onClick={() => void connect()} disabled={loading}>
-              {status?.phase === "ERROR" ? "Volver a autorizar" : "Conectar mi cuenta Atlassian"}
-            </button>
-          </div>
-        </div>
+          {status && (
+            <details className="technical-details">
+              <summary>Ver detalles técnicos</summary>
+              <JiraDiagnostics status={status} busy={loading} onCheck={() => void checkConnection()} />
+            </details>
+          )}
+        </>
       ) : (
         <>
-          <div className="integration-summary">
-            <dl>
-              <div><dt>Sitio verificado</dt><dd>{snapshot?.site_url}</dd></div>
-              <div><dt>cloudId</dt><dd><code>{snapshot?.cloud_id}</code></dd></div>
-              <div><dt>Usuario Atlassian</dt><dd>{snapshot?.atlassian_user.display_name || snapshot?.atlassian_user.account_id}</dd></div>
-              <div><dt>Autorización OAuth</dt><dd>{status.oauth_storage === "OS_ENCRYPTED" ? "Cifrada por Windows · se conserva al salir y reiniciar" : "Sólo memoria · se pierde al reiniciar"}</dd></div>
-            </dl>
-            <div className="integration-actions">
-              <button className="button secondary compact" onClick={() => void refresh()} disabled={loading}>Actualizar diagnóstico</button>
-              <button className="button ghost compact" onClick={() => void disconnect()} disabled={loading}>Desconectar</button>
+          <section className="jira-account-card" aria-label="Cuenta conectada">
+            <div className="jira-account-identity">
+              <span className="jira-account-avatar" aria-hidden="true">{userInitials(account?.display_name || account?.email || "AJ")}</span>
+              <div><strong>{account?.display_name || account?.email || "Cuenta Atlassian"}</strong><span>{jiraSiteLabel(snapshot?.site_url)}</span></div>
             </div>
-          </div>
+            <div className="jira-account-states">
+              <div className={readAvailable ? "state-ok" : "state-warning"}><span><Icon name={readAvailable ? "check" : "arrow-right"} /></span><div><strong>Lectura disponible</strong><small>{readAvailable ? "Puedes consultar información de Jira." : "La lectura necesita reconexión."}</small></div></div>
+              <div className={writeAvailable ? "state-ok" : "state-warning"}><span><Icon name={writeAvailable ? "check" : "arrow-right"} /></span><div><strong>{writeAvailable ? "Escritura activa" : "Escritura no disponible"}</strong><small>{writeAvailable ? "Puedes preparar y crear actividades según la política actual." : "La política actual mantiene las escrituras bloqueadas."}</small></div></div>
+              <div className={connected ? "state-ok" : "state-warning"}><span><Icon name={connected ? "check" : "arrow-right"} /></span><div><strong>Confirmación final requerida</strong><small>Nada se envía a Jira sin tu confirmación.</small></div></div>
+            </div>
+           </section>
 
-          <div className="space-diagnostics" aria-label="Diagnóstico de Spaces Jira">
+           <section className="jira-spaces-section" aria-labelledby="jira-spaces-title">
+            <div className="jira-section-heading"><div className="jira-section-icon"><Icon name="dashboard" /></div><div><h3 id="jira-spaces-title">Espacios disponibles</h3><p>Proyectos y espacios en los que puedes trabajar.</p></div></div>
+            <div className="jira-spaces-grid">
             {snapshot?.spaces.map((space) => (
-              <details className={space.found ? "space-ok" : "space-missing"} key={space.key}>
-                <summary>
-                  <strong>{space.key}</strong>
-                  <span>{space.found ? `${space.work_types.length} Work Types` : "No visible"}</span>
-                </summary>
-                {space.found && (
-                  <div className="work-type-list">
-                    {space.work_types.length === 0 ? (
-                      <p>El Space existe, pero no se recibieron Work Types.</p>
-                    ) : space.work_types.map((workType) => (
-                      <div key={`${space.key}-${workType.id || workType.name}`}>
-                        <strong>{workType.name}</strong>
-                        <span>{workType.fields.length} campos · {workType.fields.filter((field) => field.required).length} obligatorios</span>
-                      </div>
-                    ))}
-                  </div>
-                )}
-              </details>
+              <article className={`jira-space-card ${space.found ? "space-ok" : "space-missing"}`} key={space.key}><span>{space.key}</span><div><strong>{space.key}</strong><small>{space.found ? "Espacio de trabajo" : "No visible"}</small></div></article>
             ))}
+            </div>
+          </section>
+
+          <div className="jira-settings-actions">
+            <div><button className="button primary" onClick={() => void checkConnection()} disabled={loading}><Icon name="check" />{loading ? "Comprobando…" : "Probar conexión"}</button><small>Verifica que todo esté funcionando correctamente.</small></div>
+            <div><button className="button danger-outline" onClick={() => void disconnect()} disabled={loading}><Icon name="lock" />Desvincular Atlassian</button><small>Desconecta tu cuenta de Jira de forma segura.</small></div>
           </div>
 
-          {objective4AReadiness && (
-            <section className="objective4a-readiness" aria-label="Preparación del envío controlado">
-              <div>
-                <span className="eyebrow">Comprobación técnica</span>
-                <strong>{objective4AReadiness.controlled_write_ready ? "Prueba segura y envío controlado habilitados" : "Prueba segura habilitada; escritura real bloqueada"}</strong>
-                <p>Rovo sólo fue inspeccionado. El diagnóstico realizó {objective4AReadiness.mcp_tools.tools_invoked} invocaciones y la política reporta <code>jira_write_enabled={String(objective4AReadiness.jira_write_enabled)}</code>.</p>
-              </div>
-              <ul>
-                <li className={objective4AReadiness.mcp_tools.create.exposed ? "ok" : "pending"}>createJiraIssue {objective4AReadiness.mcp_tools.create.exposed ? "anunciada" : "pendiente"}</li>
-                <li className={objective4AReadiness.mcp_tools.readback.exposed ? "ok" : "pending"}>getJiraIssue {objective4AReadiness.mcp_tools.readback.exposed ? "anunciada" : "pendiente"}</li>
-                <li className={objective4AReadiness.real_canary_checks.task_metadata_available ? "ok" : "pending"}>Contrato AT / Task {objective4AReadiness.real_canary_checks.task_metadata_available ? "visible" : "pendiente"}</li>
-              </ul>
-            </section>
-          )}
-
-          <form className="assignee-lookup" onSubmit={lookup}>
-            <div>
-              <span className="eyebrow">Comprobación de cuentas Jira</span>
-              <p>Busca una identidad real; la asignabilidad se valida por separado durante la comprobación final.</p>
-            </div>
-            <select value={lookupSpace} onChange={(event) => setLookupSpace(event.target.value as Space)} aria-label="Space para buscar responsable">
-              <option value="AT">AT</option>
-              <option value="ASIT">ASIT</option>
-              <option value="MTTI">MTTI</option>
-            </select>
-            <input value={lookupQuery} onChange={(event) => { setLookupQuery(event.target.value); setLookupPerformed(false); }} placeholder="Nombre o correo" aria-label="Nombre o correo del responsable" minLength={2} required />
-            <button className="button secondary" disabled={loading || lookupQuery.trim().length < 2}>Buscar</button>
-          </form>
-          {assignees.length > 0 && (
-            <div className="assignee-results">
-              {assignees.map((assignee) => (
-                <div key={assignee.account_id || assignee.display_name}>
-                  <strong>{assignee.display_name}</strong>
-                  <span>{assignee.email || assignee.account_id}</span>
-                </div>
-              ))}
-            </div>
-          )}
-          {lookupPerformed && assignees.length === 0 && (
-            <div className="assignee-empty" role="status">
-              <strong>No encontramos una cuenta Jira</strong>
-              <span>No hubo coincidencias activas para “{lastLookupQuery}” en {lookupSpace}. Verifica el nombre completo o prueba con el correo corporativo.</span>
-            </div>
-          )}
-          <p className="read-only-footnote">
-            {snapshot?.write_tools_exposed_by_server || 0} herramientas no permitidas pueden estar expuestas por Rovo; esta aplicación no las invoca.
-          </p>
+          <details className="technical-details">
+            <summary>Ver detalles técnicos</summary>
+            {status && <JiraDiagnostics status={status} busy={loading} onCheck={() => void checkConnection()} />}
+            {objective4AReadiness && (
+              <section className="objective4a-readiness" aria-label="Preparación del envío controlado">
+                <div><span className="eyebrow">Comprobación técnica</span><strong>{objective4AReadiness.controlled_write_ready ? "Prueba segura y envío controlado habilitados" : "Prueba segura habilitada; escritura real bloqueada"}</strong><p>Rovo sólo fue inspeccionado. El diagnóstico realizó {objective4AReadiness.mcp_tools.tools_invoked} invocaciones y la política reporta <code>jira_write_enabled={String(objective4AReadiness.jira_write_enabled)}</code>.</p></div>
+                <ul><li className={objective4AReadiness.mcp_tools.create.exposed ? "ok" : "pending"}>createJiraIssue {objective4AReadiness.mcp_tools.create.exposed ? "anunciada" : "pendiente"}</li><li className={objective4AReadiness.mcp_tools.readback.exposed ? "ok" : "pending"}>getJiraIssue {objective4AReadiness.mcp_tools.readback.exposed ? "anunciada" : "pendiente"}</li><li className={objective4AReadiness.real_canary_checks.task_metadata_available ? "ok" : "pending"}>Contrato AT / Task {objective4AReadiness.real_canary_checks.task_metadata_available ? "visible" : "pendiente"}</li></ul>
+              </section>
+            )}
+            <div className="integration-summary"><dl><div><dt>Sitio verificado</dt><dd>{snapshot?.site_url}</dd></div><div><dt>cloudId</dt><dd><code>{snapshot?.cloud_id}</code></dd></div><div><dt>Cuenta Atlassian</dt><dd>{account?.display_name || account?.account_id}</dd></div><div><dt>Autorización OAuth</dt><dd>{status.oauth_storage === "OS_ENCRYPTED" ? "Cifrada por Windows" : "Sólo memoria"}</dd></div></dl></div>
+            <form className="assignee-lookup" onSubmit={lookup}><div><span className="eyebrow">Comprobación de cuentas Jira</span><p>Herramienta técnica para soporte; la resolución normal ocurre durante la propuesta.</p></div><select value={lookupSpace} onChange={(event) => setLookupSpace(event.target.value as Space)} aria-label="Space para buscar responsable"><option value="AT">AT</option><option value="ASIT">ASIT</option><option value="MTTI">MTTI</option></select><input value={lookupQuery} onChange={(event) => { setLookupQuery(event.target.value); setLookupPerformed(false); }} placeholder="Nombre o correo" aria-label="Nombre o correo del responsable" minLength={2} required /><button className="button secondary" disabled={loading || lookupQuery.trim().length < 2}>Buscar</button></form>
+            {assignees.length > 0 && <div className="assignee-results">{assignees.map((assignee) => <div key={assignee.account_id || assignee.display_name}><strong>{assignee.display_name}</strong><span>{assignee.email || assignee.account_id}</span></div>)}</div>}
+            {lookupPerformed && assignees.length === 0 && <div className="assignee-empty" role="status"><strong>No encontramos una cuenta Jira</strong><span>No hubo coincidencias activas para “{lastLookupQuery}” en {lookupSpace}.</span></div>}
+            <p className="read-only-footnote">{snapshot?.write_tools_exposed_by_server || 0} herramientas no permitidas pueden estar expuestas por Rovo; esta aplicación no las invoca.</p>
+          </details>
         </>
       )}
     </section>
   );
 }
 
-type HistoryFilter = "ACTIVE" | "REVIEW" | "READY" | "ARCHIVED";
+type HistoryFilter = "ACTIVE" | "REVIEW" | "READY" | "ARCHIVED" | "TRASH";
 
 export function ProposalHistory({
   proposals,
@@ -2492,12 +2966,19 @@ export function ProposalHistory({
   collapsed,
   onOpen,
   onArchive,
+  onTrash = () => undefined,
   onRestore,
+  onRename,
+  onPurge,
   onNewProposal,
   onOpenSettings,
+  onOpenDashboard,
+  onFilterChange,
   settingsActive,
+  dashboardActive,
   jiraConnected,
   jiraWriteEnabled,
+  onToggleSidebar = () => undefined,
 }: {
   proposals: ProposalSummary[];
   currentId: string | null;
@@ -2505,24 +2986,37 @@ export function ProposalHistory({
   collapsed: boolean;
   onOpen: (proposalId: string) => void;
   onArchive: (proposal: ProposalSummary) => void;
+  onTrash?: (proposal: ProposalSummary) => void;
   onRestore: (proposal: ProposalSummary) => void;
+  onRename: (proposal: ProposalSummary, displayName: string) => Promise<void>;
+  onPurge: (proposal: ProposalSummary) => void;
   onNewProposal: () => void;
   onOpenSettings: () => void;
+  onFilterChange?: (filter: HistoryFilter) => void;
   settingsActive: boolean;
+  dashboardActive?: boolean;
+  onOpenDashboard?: () => void;
   jiraConnected: boolean;
   jiraWriteEnabled: boolean;
+  onToggleSidebar?: () => void;
 }) {
   const [query, setQuery] = useState("");
   const [filter, setFilter] = useState<HistoryFilter>("ACTIVE");
+  const [editingProposalId, setEditingProposalId] = useState<string | null>(null);
+  const [editingName, setEditingName] = useState("");
+  const [savingName, setSavingName] = useState(false);
 
   const visible = useMemo(() => {
     const normalized = query.trim().toLocaleLowerCase();
     return proposals.filter((proposal) => {
       const archived = Boolean(proposal.archived);
+      const trashed = Boolean(proposal.deleted);
       const matchesFilter =
-        filter === "ARCHIVED"
+        filter === "TRASH"
+          ? trashed
+          : filter === "ARCHIVED"
           ? archived
-          : !archived &&
+          : !archived && !trashed &&
             (filter === "ACTIVE" ||
               (filter === "REVIEW" && proposal.counts.REVISAR > 0) ||
               (filter === "READY" && proposal.counts.REVISAR === 0));
@@ -2538,15 +3032,32 @@ export function ProposalHistory({
 
   return (
     <aside className="history-panel" aria-label="Historial de propuestas">
+      <div className="sidebar-brand">
+        <Logo />
+        <button
+          type="button"
+          className="sidebar-toggle"
+          onClick={onToggleSidebar}
+          aria-label="Alternar barra lateral"
+          title="Alternar barra lateral (Ctrl+B)"
+        >
+          <Icon name={collapsed ? "chevron-right" : "chevron-left"} />
+        </button>
+      </div>
+      <span className="sidebar-section-label">Centro de trabajo</span>
       <nav className="sidebar-navigation" aria-label="Acciones principales">
-        <button type="button" onClick={onNewProposal} title="Generar nueva propuesta">
-          <span className="sidebar-nav-icon">＋</span>
-          <span className="sidebar-nav-copy"><strong>Nueva propuesta</strong><small>Limpiar el área de trabajo</small></span>
+        <button type="button" data-tour-id="new-proposal" onClick={onNewProposal} title="Generar nueva propuesta">
+          <span className="sidebar-nav-icon"><Icon name="plus" /></span>
+          <span className="sidebar-nav-copy"><strong>Crear actividades</strong><small>Minuta o archivo</small></span>
         </button>
         <button type="button" className={settingsActive ? "active" : ""} onClick={onOpenSettings} title="Configurar conexión Jira">
-          <span className="sidebar-nav-icon">⚙</span>
+          <span className="sidebar-nav-icon"><Icon name="sliders" /></span>
           <span className="sidebar-nav-copy"><strong>Configuración Jira</strong><small>{jiraConnected ? jiraWriteEnabled ? "Conectada · envío controlado" : "Conectada · sólo lectura" : "Desconectada"}</small></span>
           <span className={`sidebar-connection-dot ${jiraConnected ? "online" : "offline"}`}></span>
+        </button>
+        <button type="button" className={dashboardActive ? "active" : ""} onClick={onOpenDashboard} title="Abrir Dashboard Jira" aria-current={dashboardActive ? "page" : undefined}>
+          <span className="sidebar-nav-icon"><Icon name="dashboard" /></span>
+          <span className="sidebar-nav-copy"><strong>Dashboard</strong><small>Indicadores Jira · sólo lectura</small></span>
         </button>
       </nav>
       <div className="history-heading">
@@ -2563,13 +3074,18 @@ export function ProposalHistory({
         />
         <select
           value={filter}
-          onChange={(event) => setFilter(event.target.value as HistoryFilter)}
+          onChange={(event) => {
+            const nextFilter = event.target.value as HistoryFilter;
+            setFilter(nextFilter);
+            onFilterChange?.(nextFilter);
+          }}
           aria-label="Filtrar propuestas"
         >
           <option value="ACTIVE">Activas</option>
           <option value="REVIEW">Con pendientes</option>
           <option value="READY">Sin pendientes</option>
           <option value="ARCHIVED">Archivadas</option>
+          <option value="TRASH">Papelera</option>
         </select>
       </div>
       {visible.length === 0 ? (
@@ -2580,7 +3096,7 @@ export function ProposalHistory({
         <div className="history-list">
           {visible.map((proposal) => (
             <div
-              className={`history-item ${currentId === proposal.proposal_id ? "active" : ""}`}
+              className={`history-item ${currentId === proposal.proposal_id ? "active" : ""} ${proposal.deleted ? "trashed" : ""}`}
               key={proposal.proposal_id}
               title={collapsed ? proposal.display_name : undefined}
             >
@@ -2596,50 +3112,172 @@ export function ProposalHistory({
                   <small title={`${proposal.source_file} · ${proposal.space} · versión ${proposal.version}`}>
                     {proposal.source_file} · {proposal.space} · versión {proposal.version}
                   </small>
+                  {proposal.deleted && (
+                    <small className="history-trash-note">
+                      Papelera · recuperable durante 30 días
+                    </small>
+                  )}
                 </span>
                 <span className="history-count">
                   {loadingId === proposal.proposal_id ? "…" : proposal.counts.REVISAR}
                 </span>
               </button>
-              <button
-                className="history-action"
-                onClick={() => proposal.archived ? onRestore(proposal) : onArchive(proposal)}
-                aria-label={proposal.archived ? `Restaurar ${proposal.display_name}` : `Archivar ${proposal.display_name}`}
-                title={proposal.archived ? "Restaurar" : "Archivar"}
-              >
-                {proposal.archived ? "Restaurar" : "Archivar"}
-              </button>
+              <div className="history-actions">
+                {editingProposalId === proposal.proposal_id ? (
+                  <form
+                    className="history-rename-form"
+                    onSubmit={(event) => {
+                      event.preventDefault();
+                      const nextName = editingName.trim();
+                      if (!nextName || savingName) return;
+                      setSavingName(true);
+                      void onRename(proposal, nextName)
+                        .then(() => setEditingProposalId(null))
+                        .catch(() => undefined)
+                        .finally(() => setSavingName(false));
+                    }}
+                  >
+                    <input
+                      aria-label="Nuevo nombre de la propuesta"
+                      value={editingName}
+                      onChange={(event) => setEditingName(event.target.value)}
+                      maxLength={120}
+                      required
+                      autoFocus
+                    />
+                    <button className="history-action" disabled={savingName}>Guardar</button>
+                    <button
+                      type="button"
+                      className="history-action"
+                      disabled={savingName}
+                      onClick={() => setEditingProposalId(null)}
+                    >
+                      Cancelar
+                    </button>
+                  </form>
+                ) : (
+                  <>
+                    <button
+                      type="button"
+                      className="history-action history-icon-action"
+                      onClick={() => {
+                        setEditingName(proposal.display_name);
+                        setEditingProposalId(proposal.proposal_id);
+                      }}
+                      aria-label={`Editar nombre ${proposal.display_name}`}
+                      title="Editar nombre"
+                    >
+                      <Icon name="pencil" />
+                    </button>
+                    {proposal.deleted ? (
+                      <>
+                        <button
+                          type="button"
+                          className="history-action"
+                          onClick={() => onRestore(proposal)}
+                          aria-label={`Restaurar ${proposal.display_name}`}
+                          title="Restaurar desde la papelera"
+                        >
+                          Restaurar
+                        </button>
+                        <button
+                          type="button"
+                          className="history-action danger"
+                          onClick={() => onPurge(proposal)}
+                          aria-label={`Borrar definitivamente ${proposal.display_name}`}
+                          title="Borrar definitivamente"
+                        >
+                          Borrar definitivamente
+                        </button>
+                      </>
+                    ) : (
+                      <>
+                        <button
+                          type="button"
+                          className="history-action"
+                          onClick={() => proposal.archived ? onRestore(proposal) : onArchive(proposal)}
+                          aria-label={proposal.archived ? `Restaurar ${proposal.display_name}` : `Archivar ${proposal.display_name}`}
+                          title={proposal.archived ? "Restaurar" : "Archivar"}
+                        >
+                          {proposal.archived ? "Restaurar" : "Archivar"}
+                        </button>
+                        <button
+                          type="button"
+                          className="history-action danger"
+                          onClick={() => onTrash(proposal)}
+                          aria-label={`Eliminar ${proposal.display_name}`}
+                          title="Enviar a la papelera durante 30 días"
+                        >
+                          Eliminar
+                        </button>
+                      </>
+                    )}
+                  </>
+                )}
+              </div>
             </div>
           ))}
         </div>
       )}
+      <div className="sidebar-safety" title="Jira sólo escribe después de tu confirmación">
+        <Icon name="shield" />
+        <span><strong>Modo controlado</strong><small>Sin escrituras automáticas</small></span>
+      </div>
     </aside>
   );
 }
 
-export function Workspace({ session, onLogout }: { session: Session; onLogout: () => void }) {
+function MinutesReviewBoundary({ proposal, token, onUpdated, children }: {
+  proposal: Proposal; token: string; onUpdated: (proposal: Proposal) => void; children: ReactNode;
+}) {
+  return proposal.minutes
+    ? <MinutesReview key={proposal.proposal_id} proposal={proposal} token={token} onUpdated={onUpdated}>{children}</MinutesReview>
+    : <>{children}</>;
+}
+
+export function Workspace({
+  session,
+  onLogout,
+  theme = "light",
+  onToggleTheme = () => undefined,
+}: {
+  session: Session;
+  onLogout: () => void;
+  theme?: Theme;
+  onToggleTheme?: () => void;
+}) {
   const [proposals, setProposals] = useState<ProposalSummary[]>([]);
+  const [includeTrash, setIncludeTrash] = useState(false);
   const [current, setCurrent] = useState<Proposal | null>(null);
   const [loadingId, setLoadingId] = useState("");
   const [lifecycleError, setLifecycleError] = useState("");
   const [settingsOpen, setSettingsOpen] = useState(
     () => new URLSearchParams(window.location.search).has("atlassian"),
   );
+  const [dashboardOpen, setDashboardOpen] = useState(false);
   const [atlassianStatus, setAtlassianStatus] = useState<AtlassianStatus | null>(null);
   const [sidebarCollapsed, setSidebarCollapsed] = useState(
-    () => localStorage.getItem(SIDEBAR_KEY) === "true",
+    () => false,
   );
 
-  async function refreshList() {
-    setProposals(await listProposals(session.access_token));
+  async function refreshList(requestTrash = includeTrash) {
+    try {
+      setProposals(await listProposals(session.access_token, requestTrash));
+    } catch (reason) {
+      if (!(reason instanceof ApiError && reason.status === 401)) {
+        setLifecycleError(
+          reason instanceof Error ? reason.message : "No fue posible actualizar las propuestas.",
+        );
+      }
+    }
   }
 
   useEffect(() => {
-    void refreshList();
+    void refreshList(includeTrash);
     void getAtlassianStatus(session.access_token)
       .then(setAtlassianStatus)
       .catch(() => setAtlassianStatus(null));
-  }, []);
+  }, [includeTrash]);
 
   useEffect(() => {
     localStorage.setItem(SIDEBAR_KEY, String(sidebarCollapsed));
@@ -2659,12 +3297,15 @@ export function Workspace({ session, onLogout }: { session: Session; onLogout: (
   function created(proposal: Proposal) {
     setCurrent(proposal);
     setSettingsOpen(false);
+    setDashboardOpen(false);
     void refreshList();
   }
 
   function newProposal() {
+    emitOnboardingEvent("view:new-proposal");
     setCurrent(null);
     setSettingsOpen(false);
+    setDashboardOpen(false);
     setLifecycleError("");
     window.scrollTo({ top: 0, behavior: "smooth" });
   }
@@ -2674,6 +3315,7 @@ export function Workspace({ session, onLogout }: { session: Session; onLogout: (
     try {
       setCurrent(await getProposal(session.access_token, proposalId));
       setSettingsOpen(false);
+      setDashboardOpen(false);
     } finally {
       setLoadingId("");
     }
@@ -2708,11 +3350,39 @@ export function Workspace({ session, onLogout }: { session: Session; onLogout: (
     }
   }
 
-  async function rename(name: string) {
-    if (!current || !name.trim()) return;
+  async function trash(summary: ProposalSummary) {
+    if (!window.confirm(`¿Enviar "${summary.display_name}" a la papelera? Podrás recuperarla durante 30 días.`)) {
+      return;
+    }
     setLifecycleError("");
     try {
-      await renameProposal(session.access_token, current.proposal_id, name.trim());
+      await trashProposal(session.access_token, summary.proposal_id);
+      if (current?.proposal_id === summary.proposal_id) setCurrent(null);
+      await refreshList();
+    } catch (reason) {
+      setLifecycleError(reason instanceof Error ? reason.message : "No fue posible enviar a la papelera.");
+    }
+  }
+
+  async function purge(summary: ProposalSummary) {
+    if (!window.confirm(`¿Borrar definitivamente "${summary.display_name}"? Esta acción no se puede deshacer.`)) {
+      return;
+    }
+    setLifecycleError("");
+    try {
+      await permanentlyDeleteProposal(session.access_token, summary.proposal_id);
+      if (current?.proposal_id === summary.proposal_id) setCurrent(null);
+      await refreshList();
+    } catch (reason) {
+      setLifecycleError(reason instanceof Error ? reason.message : "No fue posible borrar definitivamente.");
+    }
+  }
+
+  async function saveProposalName(proposalId: string, name: string) {
+    if (!name.trim()) return;
+    setLifecycleError("");
+    try {
+      await renameProposal(session.access_token, proposalId, name.trim());
       await refreshList();
     } catch (reason) {
       const message = reason instanceof Error ? reason.message : "No fue posible renombrar.";
@@ -2721,33 +3391,63 @@ export function Workspace({ session, onLogout }: { session: Session; onLogout: (
     }
   }
 
+  async function rename(name: string) {
+    if (!current) return;
+    await saveProposalName(current.proposal_id, name);
+  }
+
+  async function renameFromHistory(summary: ProposalSummary, name: string) {
+    await saveProposalName(summary.proposal_id, name);
+  }
+
   const currentSummary = proposals.find(
     (proposal) => proposal.proposal_id === current?.proposal_id,
   );
+  const atlassianIdentity = atlassianStatus?.snapshot?.atlassian_user;
+  const accountDisplayName =
+    atlassianIdentity?.display_name?.trim() ||
+    atlassianIdentity?.email?.trim() ||
+    session.user.display_name?.trim() ||
+    session.user.email?.trim() ||
+    session.user.username;
+  const workspaceTitle = settingsOpen
+    ? "Conexión con Jira"
+    : dashboardOpen
+      ? "Dashboard de equipos"
+    : current
+      ? currentSummary?.display_name ?? current.source_file.name.replace(/\.xlsx$/i, "")
+      : "Crear actividades";
+  const workspaceSection = settingsOpen
+    ? "Administración"
+    : dashboardOpen
+      ? "Jira · Solo lectura"
+    : current
+      ? "Propuesta en curso"
+      : "Preparar actividades";
 
   return (
     <div className={`app-shell ${sidebarCollapsed ? "sidebar-collapsed" : ""}`}>
       <header className="topbar">
-        <button
-          className="sidebar-toggle"
-          onClick={() => setSidebarCollapsed((value) => !value)}
-          aria-label="Alternar barra lateral"
-          title="Alternar barra lateral (Ctrl+B)"
-        >
-          {sidebarCollapsed ? "›" : "‹"}
-        </button>
-        <Logo />
+        <div className="mobile-brand" aria-label="Agente Jira">AJ</div>
+        <div className="topbar-context">
+          <span>{workspaceSection}</span>
+          <strong>{workspaceTitle}</strong>
+        </div>
         <div className={`environment-badge ${atlassianStatus?.connected ? atlassianStatus.jira_write_enabled ? "controlled" : "" : "offline"}`}>
-          <span></span> Local · {atlassianStatus?.connected ? atlassianStatus.jira_write_enabled ? "Jira conectada · envío controlado" : "Jira conectada en solo lectura" : "Jira desconectada"}
+          <span></span> Local · {atlassianStatus?.connected ? atlassianStatus.jira_write_enabled ? "Jira conectada" : "Jira conectada en solo lectura" : "Jira desconectada"} · {atlassianStatus?.global_write_lock?.state === "UNLOCKED_TEMPORARY" ? "⚠ Escrituras habilitadas temporalmente" : "🔒 Escrituras bloqueadas"}
         </div>
         <div className="mobile-actions" aria-label="Acciones principales">
-          <button type="button" onClick={newProposal} aria-label="Generar nueva propuesta" title="Nueva propuesta">＋</button>
-          <button type="button" onClick={() => { setSettingsOpen(true); setCurrent(null); }} aria-label="Configurar Jira" title="Configuración Jira">⚙</button>
+          <button type="button" onClick={newProposal} aria-label="Generar nueva propuesta" title="Nueva propuesta"><Icon name="plus" /></button>
+          <button type="button" onClick={() => { setSettingsOpen(false); setCurrent(null); setDashboardOpen(true); }} aria-label="Abrir Dashboard Jira" title="Dashboard Jira"><Icon name="dashboard" /></button>
+          <button type="button" onClick={() => { setSettingsOpen(true); setCurrent(null); }} aria-label="Configurar Jira" title="Configuración Jira"><Icon name="sliders" /></button>
         </div>
         <div className="user-menu">
-          <span>
-            <strong>{session.user.display_name}</strong>
-            <small>{session.user.username}</small>
+          <ThemeToggle theme={theme} onToggle={onToggleTheme} />
+          <button type="button" className="button ghost onboarding-repeat" onClick={() => emitOnboardingEvent("repeat")} aria-label="Repetir recorrido guiado" title="Repetir recorrido guiado">Ayuda</button>
+          <span className="user-avatar" aria-hidden="true">{userInitials(accountDisplayName)}</span>
+          <span className="user-details">
+            <strong>{accountDisplayName}</strong>
+            <small>{session.user.email || session.user.username}</small>
           </span>
           <button className="button ghost" onClick={onLogout}>Salir</button>
         </div>
@@ -2760,18 +3460,28 @@ export function Workspace({ session, onLogout }: { session: Session; onLogout: (
           collapsed={sidebarCollapsed}
           onOpen={(proposalId) => void openProposal(proposalId)}
           onArchive={(proposal) => void archive(proposal)}
+          onTrash={(proposal) => void trash(proposal)}
           onRestore={(proposal) => void restore(proposal)}
+          onRename={renameFromHistory}
+          onPurge={(proposal) => void purge(proposal)}
           onNewProposal={newProposal}
           onOpenSettings={() => { setSettingsOpen(true); setCurrent(null); }}
+          onOpenDashboard={() => { setSettingsOpen(false); setCurrent(null); setDashboardOpen(true); }}
+          onFilterChange={(filter) => setIncludeTrash(filter === "TRASH")}
           settingsActive={settingsOpen}
+          dashboardActive={dashboardOpen}
           jiraConnected={Boolean(atlassianStatus?.connected)}
           jiraWriteEnabled={Boolean(atlassianStatus?.jira_write_enabled)}
+          onToggleSidebar={() => setSidebarCollapsed((value) => !value)}
         />
         <div className="content-area">
           {lifecycleError && <div className="alert error">{lifecycleError}</div>}
           {settingsOpen ? (
             <AtlassianConnectionPanel token={session.access_token} onStatusChange={setAtlassianStatus} />
+          ) : dashboardOpen ? (
+            <Dashboard token={session.access_token} />
           ) : current ? (
+            <MinutesReviewBoundary proposal={current} token={session.access_token} onUpdated={updated}>
             <ProposalReview
               token={session.access_token}
               proposal={current}
@@ -2780,43 +3490,57 @@ export function Workspace({ session, onLogout }: { session: Session; onLogout: (
               onUpdated={updated}
               onNewProposal={newProposal}
             />
+            </MinutesReviewBoundary>
           ) : (
-            <>
-              <UploadPanel token={session.access_token} onCreated={created} />
-              <section className="welcome-card">
-                <span className="welcome-mark">01</span>
-                <div>
-                  <span className="eyebrow">Comienza aquí</span>
-                  <h2>Genera una nueva propuesta</h2>
-                  <p>
-                    Carga el plan y sigue los tres pasos indicados: revisar, validar con Jira y probar el envío.
-                  </p>
-                </div>
-              </section>
-            </>
+            <NewProposal token={session.access_token} displayName={accountDisplayName} telegramUrl={session.radar_telegram_url} onCreated={created} excel={<UploadPanel token={session.access_token} onCreated={created} />} />
           )}
         </div>
       </main>
+      <Onboarding token={session.access_token} displayName={accountDisplayName} />
+      {VOICE_UI_ENABLED && (
+        <VoiceAssistant
+          token={session.access_token}
+          proposalId={current?.proposal_id ?? null}
+        />
+      )}
     </div>
   );
 }
 
 export default function App() {
-  const [session, setSession] = useState<Session | null>(() => readSession());
+  const [session, setSession] = useState<Session | null>(null);
+  const [authLoading, setAuthLoading] = useState(true);
+  const [theme, setTheme] = useState<Theme>(() => readInitialTheme());
 
-  function handleLogin(nextSession: Session) {
-    sessionStorage.setItem(SESSION_KEY, JSON.stringify(nextSession));
-    setSession(nextSession);
-  }
+  useEffect(() => applyTheme(theme), [theme]);
+
+  useEffect(() => {
+    const expireSession = () => {
+      setSession(null);
+    };
+    window.addEventListener(SESSION_EXPIRED_EVENT, expireSession);
+    return () => window.removeEventListener(SESSION_EXPIRED_EVENT, expireSession);
+  }, []);
+
+  useEffect(() => {
+    getCurrentSession().then(setSession).catch(() => setSession(null)).finally(() => setAuthLoading(false));
+  }, []);
 
   async function logout() {
-    sessionStorage.removeItem(SESSION_KEY);
+    await logoutSession().catch(() => undefined);
     setSession(null);
   }
 
+  if (authLoading) return <main className="login-layout"><p className="muted">Verificando sesión…</p></main>;
+
   return session ? (
-    <Workspace session={session} onLogout={logout} />
+    <Workspace
+      session={session}
+      onLogout={logout}
+      theme={theme}
+      onToggleTheme={() => setTheme((value) => value === "light" ? "dark" : "light")}
+    />
   ) : (
-    <LoginScreen onLogin={handleLogin} />
+    <LoginScreen />
   );
 }

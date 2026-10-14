@@ -4,17 +4,43 @@
   "title": "Propuesta controlada de work items Jira v1.1",
   "type": "object",
   "additionalProperties": false,
+  "allOf": [
+    {
+      "if": { "required": ["minutes"] },
+      "then": { "properties": { "items": { "minItems": 0 } } },
+      "else": { "properties": { "items": { "minItems": 1 } } }
+    }
+  ],
   "required": ["proposal_id", "version", "template_version", "status", "source_file", "defaults", "items"],
   "properties": {
     "proposal_id": { "type": "string", "format": "uuid" },
     "version": { "type": "integer", "minimum": 1 },
-    "template_version": { "const": "1.1" },
+    "template_version": { "enum": ["1.1", "1.2", "1.3"] },
     "status": {
       "enum": ["UPLOADED", "NORMALIZED", "NEEDS_INPUT", "DRAFT", "VALIDATED", "APPROVED", "EXECUTING", "PARTIAL_SUCCESS", "COMPLETED", "FAILED", "CANCELLED"]
     },
     "source_file": { "$ref": "#/$defs/source_file" },
+    "minutes": {
+      "type": "object", "additionalProperties": false,
+      "required": ["prompt_version", "document", "warnings"],
+      "properties": {
+        "prompt_version": { "type": "string" },
+        "extraction_mode": { "enum": ["DETERMINISTIC_EXPLICIT", "DETERMINISTIC_LIST", "HYBRID_ENRICHED", "HYBRID_SEMANTIC", "LLM_INFERRED", "DETERMINISTIC_FALLBACK"] },
+        "document": { "type": "object" },
+        "warnings": { "type": "array", "items": { "type": "string" } },
+        "enrichment": {
+          "type": "object", "additionalProperties": false,
+          "required": ["state", "base_version", "message"],
+          "properties": {
+            "state": { "enum": ["PENDING", "READY", "FAILED", "STALE", "NONE"] },
+            "base_version": { "type": "integer", "minimum": 1 },
+            "message": { "type": ["string", "null"] }
+          }
+        }
+      }
+    },
     "defaults": { "$ref": "#/$defs/defaults" },
-    "items": { "type": "array", "minItems": 1, "items": { "$ref": "#/$defs/item" } },
+    "items": { "type": "array", "items": { "$ref": "#/$defs/item" } },
     "created_at": { "type": "string", "format": "date-time" },
     "created_by": { "type": "string", "minLength": 1 },
     "approved_at": { "type": ["string", "null"], "format": "date-time" },
@@ -49,13 +75,33 @@
       "required": ["source_row", "actividad", "responsable_display", "estado_actual"],
       "properties": {
         "source_row": { "type": "integer", "minimum": 6 },
+        "source_section": { "type": ["string", "null"] },
+        "source_evidence": { "type": "string" },
+        "inferred": { "type": "boolean" },
         "actividad": { "type": "string", "minLength": 1 },
         "responsable_display": { "type": "string", "minLength": 1 },
+        "area_responsable": { "type": ["string", "null"], "maxLength": 120 },
+        "area_source": {
+          "enum": [
+            "LOCAL",
+            "JIRA",
+            "SINGLE_MAPPING",
+            "TEXT_CONFIRMED",
+            "TEXT_EVIDENCE",
+            "USER_SELECTED",
+            "MANUAL",
+            "UNRESOLVED"
+          ]
+        },
+        "area_status": { "enum": ["EXPLICIT", "AMBIGUOUS", "UNSPECIFIED"] },
+        "area_candidates": { "type": "array", "items": { "type": "string", "maxLength": 120 } },
+        "area_mentions": { "type": "array", "items": { "type": "string", "maxLength": 120 } },
         "frente_trabajo_origen": { "type": ["string", "null"] },
         "contexto_resultado": { "type": ["string", "null"] },
         "fecha_objetivo": { "type": ["string", "null"], "format": "date" },
         "estado_actual": { "enum": ["Pendiente", "En curso", "En pausa", "Completada", "Rechazada", "Por confirmar"] },
-        "comentarios": { "type": ["string", "null"] }
+        "comentarios": { "type": ["string", "null"] },
+        "tipo_seguimiento_origen": { "type": ["string", "null"] }
       }
     },
     "assignee": {
@@ -140,7 +186,10 @@
         "source_state_override_reason": { "type": ["string", "null"] },
         "source_state_override_at": { "type": ["string", "null"], "format": "date-time" },
         "source_state_override_by": { "type": ["string", "null"] },
-        "reactivation_reviewed": { "type": "boolean" }
+        "reactivation_reviewed": { "type": "boolean" },
+        "manual_exclusion_reason": { "type": ["string", "null"] },
+        "manual_excluded_at": { "type": ["string", "null"], "format": "date-time" },
+        "manual_excluded_by": { "type": ["string", "null"] }
       }
     },
     "execution": {

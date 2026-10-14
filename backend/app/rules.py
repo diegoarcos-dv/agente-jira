@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import re
+from datetime import date
 from typing import Any, Iterable
 
 
@@ -92,14 +93,31 @@ def collect_review_requirements(
                 ),
             }
         )
-    if source["estado_actual"] == "Por confirmar" and "source_state" not in confirmed:
-        requirements.append(
-            {
-                "code": "SOURCE_STATE_UNCONFIRMED",
-                "field": "confirm_source_state",
-                "message": "Confirma que la actividad sigue vigente.",
-            }
-        )
+    if source["estado_actual"] == "Por confirmar":
+        due_date = source.get("fecha_objetivo")
+        try:
+            target_date = date.fromisoformat(str(due_date)) if due_date else None
+        except ValueError:
+            target_date = None
+        if target_date and target_date < date.today():
+            requirements.append(
+                {
+                    "code": "DUE_DATE_EXPIRED",
+                    "field": "due_date_candidate",
+                    "message": (
+                        f"La fecha objetivo {target_date.isoformat()} ya pasó. "
+                        "Actualízala para crear la actividad."
+                    ),
+                }
+            )
+        elif not target_date and "source_state" not in confirmed:
+            requirements.append(
+                {
+                    "code": "SOURCE_STATE_UNCONFIRMED",
+                    "field": "confirm_source_state",
+                    "message": "Confirma que la actividad sigue vigente.",
+                }
+            )
     if work_type == "Subtask" and not parent_row_id:
         requirements.append(
             {

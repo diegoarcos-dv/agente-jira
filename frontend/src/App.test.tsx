@@ -1,7 +1,7 @@
 import { cleanup, fireEvent, render, screen } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
-import App, { AtlassianConnectionPanel, ProposalHistory, ProposalReview, Workspace } from "./App";
+import App, { AtlassianConnectionPanel, ProposalHistory, ProposalReview, UploadPanel, Workspace } from "./App";
 import type { Objective4AIntent, Proposal, ProposalSummary } from "./types";
 
 describe("App", () => {
@@ -14,14 +14,68 @@ describe("App", () => {
     vi.unstubAllGlobals();
   });
 
-  it("muestra el acceso local antes de iniciar sesión", () => {
+  it("muestra el acceso federado antes de iniciar sesión", async () => {
+    vi.stubGlobal("fetch", vi.fn(async () => ({
+      ok: false,
+      status: 401,
+      json: async () => ({ detail: "Sesión inválida o vencida." }),
+    }) as Response));
     render(<App />);
-    expect(screen.getByRole("heading", { name: "Inicia sesión" })).toBeInTheDocument();
-    expect(
-      screen.getByText("Desarrollo local · autorización Atlassian cifrada para el usuario de Windows"),
-    ).toBeInTheDocument();
-    expect(screen.getByText(/recuperación de contraseña se habilitará con Cognito/i)).toBeInTheDocument();
-    expect(screen.getByRole("button", { name: "Mostrar contraseña" })).toBeInTheDocument();
+    expect(await screen.findByRole("heading", { name: "Accede con tu cuenta corporativa" })).toBeInTheDocument();
+    expect(screen.getByText("Entorno local seguro")).toBeInTheDocument();
+    expect(screen.getByText(/Agente Jira no recibe ni almacena tu contraseña/i)).toBeInTheDocument();
+    expect(screen.getAllByRole("button", { name: "Continuar con Atlassian" })).toHaveLength(1);
+    expect(screen.queryByRole("textbox")).not.toBeInTheDocument();
+  });
+
+  it("carga los cinco valores generales de una nueva propuesta como menús de Jira", async () => {
+    const fields = [
+      ["iniciativa", "Iniciativa", ["Agentes Telmex", "Big Data"]],
+      ["linea_trabajo", "Línea de trabajo", ["IA / ML", "Soporte"]],
+      ["sprint", "Sprint", []],
+      ["tipo_seguimiento", "Tipo de seguimiento", ["Actividad concreta", "Proyecto estándar"]],
+      ["semaforo", "Semáforo", ["Verde - En forma", "Rojo - Bloqueado / crítico"]],
+    ].map(([businessKey, name, values]) => ({
+      id: `customfield_${businessKey}`,
+      name,
+      required: false,
+      business_key: businessKey,
+      options: (values as string[]).map((value) => ({ value, label: value })),
+    }));
+    vi.stubGlobal("fetch", vi.fn(async (input: RequestInfo | URL) => {
+      const url = input.toString();
+      if (url.endsWith("/api/integrations/atlassian/status")) return {
+        ok: true,
+        json: async () => ({
+          connected: true,
+          phase: "CONNECTED",
+          error: null,
+          snapshot: {
+            spaces: [{
+              key: "AT", found: true, id: "100", name: "AT", project_type: "software",
+              work_types: [{ id: "10", name: "Task", subtask: false, fields }],
+            }],
+          },
+        }),
+      } as Response;
+      if (url.includes("/api/integrations/atlassian/sprints?")) return {
+        ok: true,
+        json: async () => [{ id: "321", name: "SPT-ACTIVO", state: "active", board_id: "45", source: "ROVO_MCP_JQL" }],
+      } as Response;
+      return { ok: false, status: 404, json: async () => ({ detail: "Ruta inesperada" }) } as Response;
+    }));
+
+    render(<UploadPanel token="local-token" onCreated={() => undefined} />);
+    await userEvent.click(screen.getByRole("button", { name: "Configurar campos de Jira" }));
+
+    expect(await screen.findByRole("option", { name: "SPT-ACTIVO · Activo" })).toBeInTheDocument();
+    for (const field of ["Iniciativa", "Línea de trabajo", "Sprint", "Tipo de seguimiento", "Semáforo"]) {
+      expect(screen.getByRole("combobox", { name: field })).toBeEnabled();
+    }
+    expect(screen.getByRole("option", { name: "Agentes Telmex" })).toBeInTheDocument();
+    expect(screen.getByRole("option", { name: "IA / ML" })).toBeInTheDocument();
+    expect(screen.getByRole("option", { name: "Actividad concreta" })).toBeInTheDocument();
+    expect(screen.getByRole("option", { name: "Verde - En forma" })).toBeInTheDocument();
   });
 
   it("muestra el diagnóstico Jira real sin habilitar escritura", async () => {
@@ -74,7 +128,7 @@ describe("App", () => {
 
     expect(await screen.findByText("https://dpti.atlassian.net")).toBeInTheDocument();
     expect(screen.getByText("cloud-123")).toBeInTheDocument();
-    expect(screen.getByText("Conectado · solo lectura")).toBeInTheDocument();
+    expect(screen.getByText("Jira conectado")).toBeInTheDocument();
     expect(screen.getByText(/7 herramientas no permitidas/)).toBeInTheDocument();
 
     await userEvent.type(screen.getByLabelText("Nombre o correo del responsable"), "Giselle");
@@ -261,6 +315,39 @@ describe("App", () => {
     expect(screen.getAllByText("Actividad completada")).toHaveLength(2);
   });
 
+  it("mantiene los campos generales como desplegables y pide reautorizar cuando Jira vence", async () => {
+    const proposal: Proposal = {
+      proposal_id: "catalogs-expired", version: 1, template_version: "1.1", status: "VALIDATED",
+      source_file: { name: "catalogos.xlsx", sha256: "c".repeat(64) },
+      defaults: { space: "ASIT", iniciativa: "EFE", linea_trabajo: null, sprint: "FEWFW", tipo_seguimiento: "FEFE", semaforo: "FEF" },
+      created_at: "2026-08-21T10:00:00Z", created_by: "tester", approved_at: null, approved_by: null,
+      items: [{
+        source: { source_row: 6, actividad: "Actividad", responsable_display: "Persona", frente_trabajo_origen: null, contexto_resultado: null, fecha_objetivo: null, estado_actual: "Pendiente", comentarios: null },
+        generated: { row_id: "ROW-0006", create_in_jira: true, decision: "INCLUIR", decision_reason: "Lista", work_type: "Task", title: "Actividad", description: "Actividad", space: "ASIT", parent_row_id: null, assignee: { display_name: "Persona", email: null, account_id: "jira-persona", resolution: "RESOLVED" }, fields: {}, confidence: .9 },
+        validation: { errors: [], warnings: [], pending_requirements: [] }, review: { user_modified: false, approved: false, review_note: null }, execution: { result: "NOT_STARTED" },
+      }],
+    };
+    vi.stubGlobal("fetch", vi.fn(async (input: RequestInfo | URL) => {
+      const url = input.toString();
+      if (url.endsWith("/dry-run/latest")) return { ok: false, status: 404, json: async () => ({ detail: "Sin validación" }) } as Response;
+      if (url.endsWith("/api/integrations/atlassian/status")) return {
+        ok: true,
+        json: async () => ({ connected: false, phase: "ERROR", error: "La autorización Atlassian guardada venció.", snapshot: null }),
+      } as Response;
+      return { ok: false, status: 404, json: async () => ({ detail: "Ruta inesperada" }) } as Response;
+    }));
+
+    render(<ProposalReview token="token" proposal={proposal} displayName="Catálogos" onRename={async () => undefined} onUpdated={() => undefined} onNewProposal={() => undefined} />);
+    await userEvent.click(screen.getByRole("button", { name: "Editar valores" }));
+    expect(await screen.findByText("Conecta Jira para recuperar los menús desplegables")).toBeInTheDocument();
+    expect(screen.getByRole("button", { name: "Volver a autorizar Jira" })).toBeInTheDocument();
+    expect(screen.getByRole("button", { name: "Conecta Jira para guardar" })).toBeDisabled();
+    for (const field of ["Iniciativa", "Línea de trabajo", "Sprint", "Tipo de seguimiento", "Semáforo"]) {
+      expect(screen.getByRole("combobox", { name: field })).toBeDisabled();
+    }
+    expect(screen.queryByText(/captura manual/i)).not.toBeInTheDocument();
+  });
+
   it("muestra pendientes accionables y revalida sin pedir una decisión manual", async () => {
     const proposal: Proposal = {
       proposal_id: "22222222-2222-4222-8222-222222222222",
@@ -287,7 +374,7 @@ describe("App", () => {
           responsable_display: "Wilfrido / José",
           frente_trabajo_origen: "Backend",
           contexto_resultado: null,
-          fecha_objetivo: null,
+          fecha_objetivo: "2026-08-15",
           estado_actual: "Pendiente",
           comentarios: null,
         },
@@ -388,6 +475,8 @@ describe("App", () => {
       assignee_account_id: "jira-account-wilfrido",
       assignee_query: "Wilfrido / José",
     });
+    expect(JSON.parse(String(patchCall?.[1]?.body))).not.toHaveProperty("due_date_candidate");
+    expect(screen.queryByLabelText("Fecha objetivo (no es la fecha de la minuta)")).not.toBeInTheDocument();
     expect(
       vi.mocked(fetch).mock.calls.some(([, options]) => options?.method === "PATCH"),
     ).toBe(true);
@@ -438,7 +527,7 @@ describe("App", () => {
     expect(await screen.findByText(/pasó a Requieren revisión/i)).toBeInTheDocument();
   });
 
-  it("aprueba, bloquea y muestra las acciones de descarga y reapertura", async () => {
+  it("valida, bloquea y mantiene disponibles la evidencia y la edición", async () => {
     const proposal: Proposal = {
       proposal_id: "44444444-4444-4444-8444-444444444444", version: 3, template_version: "1.1", status: "VALIDATED",
       source_file: { name: "listo.xlsx", sha256: "d".repeat(64) },
@@ -464,12 +553,12 @@ describe("App", () => {
     }) as Response));
     const onUpdated = vi.fn();
     render(<ProposalReview token="token" proposal={proposal} displayName="Plan listo" onRename={async () => undefined} onUpdated={onUpdated} onNewProposal={() => undefined} />);
-    await userEvent.click(screen.getByRole("button", { name: "Revisar y aprobar propuesta final" }));
-    expect(screen.getByRole("dialog", { name: "Aprobar Plan listo" })).toBeInTheDocument();
-    await userEvent.click(screen.getByLabelText(/Revisé las actividades incluidas/i));
-    await userEvent.click(screen.getByRole("button", { name: "Aprobar y ejecutar prevalidación final" }));
-    expect(onUpdated).toHaveBeenCalledWith(approved);
+    expect(screen.getAllByText("Comprobar en Jira").length).toBeGreaterThanOrEqual(2);
+    expect(screen.getByText("Revisar y crear")).toBeInTheDocument();
+    expect(screen.queryByText("Probar y enviar")).not.toBeInTheDocument();
+    await userEvent.click(screen.getByRole("button", { name: "Comprobar en Jira" }));
     expect(await screen.findByText(/Validación con Jira completada para la versión 4/)).toBeInTheDocument();
+    expect(onUpdated).toHaveBeenCalledWith(approved);
 
     cleanup();
     const dryRun = {
@@ -504,14 +593,14 @@ describe("App", () => {
       return { ok: true, json: async () => approved } as Response;
     }));
     render(<ProposalReview token="token" proposal={approved} displayName="Plan listo" onRename={async () => undefined} onUpdated={() => undefined} onNewProposal={() => undefined} />);
-    expect(screen.getByText("Versión aprobada; falta comprobarla contra Jira")).toBeInTheDocument();
-    await userEvent.click(screen.getByRole("button", { name: "Ejecutar prevalidación final" }));
-    expect((await screen.findAllByText("Prevalidación completada")).length).toBeGreaterThan(0);
-    await userEvent.click(screen.getByText("Resultado de la validación con Jira"));
+    expect(screen.getByText("La propuesta debe validarse con Jira")).toBeInTheDocument();
+    await userEvent.click(screen.getByRole("button", { name: "Comprobar en Jira" }));
+    expect(await screen.findByText("1 actividad lista para confirmar y crear")).toBeInTheDocument();
+    await userEvent.click(screen.getByText("Resultado de la comprobación en Jira"));
     expect(screen.getByText("✓ Cero escrituras Jira")).toBeInTheDocument();
     expect(screen.getByText("AJI-test")).toBeInTheDocument();
     expect(screen.getByRole("button", { name: "Descargar evidencia JSON" })).toBeInTheDocument();
-    expect(screen.getByRole("button", { name: "Reabrir para editar" })).toBeInTheDocument();
+    expect(screen.getByRole("button", { name: "Editar propuesta" })).toBeInTheDocument();
 
     cleanup();
     const reopened: Proposal = {
@@ -565,7 +654,7 @@ describe("App", () => {
     await userEvent.click(screen.getByRole("button", { name: "Resolver siguiente bloqueo" }));
     expect(await screen.findByLabelText("Corrección requerida")).toBeInTheDocument();
     expect(screen.getByText("Busca y selecciona una cuenta Jira real para esta actividad.")).toBeInTheDocument();
-    expect(screen.getByText("Resultado de la validación con Jira")).toBeInTheDocument();
+    expect(screen.getByText("Resultado de la comprobación en Jira")).toBeInTheDocument();
   });
 
   it("guía la preparación, confirmación y simulación 4A con cero escrituras", async () => {
@@ -748,9 +837,30 @@ describe("App", () => {
         display_name_updated_at: null,
         display_name_updated_by: null,
       },
+      {
+        proposal_id: "third",
+        version: 1,
+        status: "NEEDS_INPUT",
+        source_file: "plan_en_papelera.xlsx",
+        display_name: "Plan en papelera",
+        space: "AT",
+        counts: { INCLUIR: 0, REVISAR: 1, EXCLUIR: 0 },
+        created_at: "2026-07-16T12:00:00Z",
+        archived: false,
+        archived_at: null,
+        archived_by: null,
+        deleted: true,
+        deleted_at: "2026-07-17T12:00:00Z",
+        deleted_by: "tester",
+        purge_at: "2026-08-16T12:00:00Z",
+        display_name_updated_at: null,
+        display_name_updated_by: null,
+      },
     ];
     const onArchive = vi.fn();
     const onRestore = vi.fn();
+    const onRename = vi.fn(async () => undefined);
+    const onPurge = vi.fn();
 
     render(
       <ProposalHistory
@@ -761,6 +871,8 @@ describe("App", () => {
         onOpen={() => undefined}
         onArchive={onArchive}
         onRestore={onRestore}
+        onRename={onRename}
+        onPurge={onPurge}
         onNewProposal={() => undefined}
         onOpenSettings={() => undefined}
         settingsActive={false}
@@ -772,6 +884,13 @@ describe("App", () => {
     await userEvent.type(screen.getByLabelText("Buscar propuestas"), "activo");
     expect(screen.getByText("Plan activo con un nombre operativo suficientemente extenso")).toBeInTheDocument();
     expect(screen.getByTitle("plan_timeline_referencia_con_nombre_extenso.xlsx · AT · versión 2")).toBeInTheDocument();
+    await userEvent.click(screen.getByRole("button", { name: "Editar nombre Plan activo con un nombre operativo suficientemente extenso" }));
+    const nameInput = screen.getByRole("textbox", { name: "Nuevo nombre de la propuesta" });
+    await userEvent.clear(nameInput);
+    await userEvent.type(nameInput, "Plan renombrado");
+    await userEvent.click(screen.getByRole("button", { name: "Guardar" }));
+    expect(onRename).toHaveBeenCalledWith(summaries[0], "Plan renombrado");
+    expect(screen.queryByRole("button", { name: /Borrar definitivamente/ })).not.toBeInTheDocument();
     await userEvent.click(screen.getByRole("button", { name: "Archivar Plan activo con un nombre operativo suficientemente extenso" }));
     expect(onArchive).toHaveBeenCalledWith(summaries[0]);
 
@@ -780,6 +899,11 @@ describe("App", () => {
     expect(screen.getByText("Plan archivado")).toBeInTheDocument();
     await userEvent.click(screen.getByRole("button", { name: "Restaurar Plan archivado" }));
     expect(onRestore).toHaveBeenCalledWith(summaries[1]);
+
+    await userEvent.selectOptions(screen.getByLabelText("Filtrar propuestas"), "TRASH");
+    expect(screen.getByText("Plan en papelera")).toBeInTheDocument();
+    await userEvent.click(screen.getByRole("button", { name: "Borrar definitivamente Plan en papelera" }));
+    expect(onPurge).toHaveBeenCalledWith(summaries[2]);
   });
 
   it("alterna y conserva la barra lateral con Ctrl+B", () => {
@@ -803,6 +927,36 @@ describe("App", () => {
     expect(localStorage.getItem("agente-jira-sidebar-collapsed")).toBe("true");
   });
 
+  it("muestra la identidad real de Atlassian cuando difiere del usuario local", async () => {
+    vi.stubGlobal("fetch", vi.fn(async (input: RequestInfo | URL) => {
+      const url = input.toString();
+      if (url.includes("/api/integrations/atlassian/status")) {
+        return {
+          ok: true,
+          json: async () => ({
+            connected: true,
+            phase: "CONNECTED",
+            oauth_storage: "OS_ENCRYPTED",
+            jira_write_enabled: false,
+            write_tools_blocked: true,
+            error: null,
+            snapshot: { atlassian_user: { display_name: "José Usuario", email: "jose@empresa.com" } },
+          }),
+        } as Response;
+      }
+      return { ok: true, json: async () => [] } as Response;
+    }));
+    render(
+      <Workspace
+        session={{ access_token: "local-token", token_type: "bearer", user: { username: "admin@agentejira.local", display_name: "Administrador local", email: "admin@agentejira.local" } }}
+        onLogout={() => undefined}
+      />,
+    );
+
+    expect(await screen.findByText("José Usuario")).toBeInTheDocument();
+    expect(screen.queryByText("Administrador local")).not.toBeInTheDocument();
+  });
+
   it("abre la configuración Jira desde la barra lateral y mantiene limpia la vista principal", async () => {
     vi.stubGlobal("fetch", vi.fn(async (input: RequestInfo | URL) => {
       const url = input.toString();
@@ -818,9 +972,9 @@ describe("App", () => {
       />,
     );
 
-    expect(screen.queryByRole("heading", { name: "Conexión de la aplicación con Jira" })).not.toBeInTheDocument();
+    expect(screen.queryByRole("heading", { name: "Conexión con Jira" })).not.toBeInTheDocument();
     await userEvent.click(screen.getByRole("button", { name: /Configuración Jira/ }));
-    expect(await screen.findByRole("heading", { name: "Conexión de la aplicación con Jira" })).toBeInTheDocument();
-    expect(screen.queryByRole("heading", { name: "Carga el plan de trabajo" })).not.toBeInTheDocument();
+    expect(await screen.findByRole("heading", { name: "Cuenta Atlassian y Jira" })).toBeInTheDocument();
+    expect(screen.queryByRole("heading", { name: "Nuevo plan" })).not.toBeInTheDocument();
   });
 });

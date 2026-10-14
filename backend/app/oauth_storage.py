@@ -98,12 +98,32 @@ class EncryptedFileOAuthStorage(TokenStorage):
         username: str,
         protector: DataProtector,
     ) -> None:
-        identity = hashlib.sha256(username.strip().casefold().encode("utf-8")).hexdigest()
-        self.path = directory / f"{identity}.oauth"
+        self.path = self.path_for(directory, username)
         self.protector = protector
         self.tokens: OAuthToken | None = None
         self.client_info: OAuthClientInformationFull | None = None
         self._load()
+
+    @staticmethod
+    def path_for(directory: Path, username: str) -> Path:
+        identity = hashlib.sha256(username.strip().casefold().encode("utf-8")).hexdigest()
+        return directory / f"{identity}.oauth"
+
+    @classmethod
+    def clear_persisted(cls, directory: Path, username: str) -> None:
+        """Remove an unreadable OAuth file without attempting to decrypt it first."""
+        cls.path_for(directory, username).unlink(missing_ok=True)
+
+    @classmethod
+    def move_persisted(cls, directory: Path, source_username: str, destination_username: str) -> None:
+        """Atomically move one encrypted credential without ever decrypting it."""
+
+        source = cls.path_for(directory, source_username)
+        destination = cls.path_for(directory, destination_username)
+        if source == destination or not source.exists():
+            return
+        destination.parent.mkdir(parents=True, exist_ok=True)
+        os.replace(source, destination)
 
     @property
     def has_credentials(self) -> bool:

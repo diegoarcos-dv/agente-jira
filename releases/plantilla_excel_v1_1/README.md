@@ -12,10 +12,12 @@ Esta carpeta contiene la versión canónica y congelada del contrato de entrada 
 La huella SHA-256 del archivo canónico es:
 
 ```text
-9a4b913d55a27afdbee04efbc011ed134b394190eeaf968e94b2150b010f4204
+b7acbbfa54a412688d73ebcc2eb9e87447c35bb1dc247cf8e11c47efb5e69dda
 ```
 
 La huella identifica la plantilla vacía canónica. Los archivos llenados por los usuarios tendrán una huella diferente y se validarán mediante versión, hoja, encabezados, tipos y reglas.
+
+Corrección compatible del 17 de agosto de 2026: las definiciones internas de las tablas se alinearon con el encabezado `Frente_de_trabajo_o_Proyecto` para evitar que Microsoft Excel solicite reparar el libro. El contrato, los datos, las validaciones y el formato de la versión 1.1 no cambiaron.
 
 ## Política de cambio
 

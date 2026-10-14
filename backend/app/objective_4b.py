@@ -1,12 +1,12 @@
 from __future__ import annotations
 
 import copy
-import hashlib
-import json
 import re
+from collections.abc import Callable
 from datetime import UTC, datetime, timedelta
-from typing import Any, Callable, Protocol
+from typing import Any, ClassVar, Protocol
 
+from .controlled_jira import ControlledJiraCreateCore, canonical_hash, readback_checks
 from .execution_policy import JiraExecutionPolicy
 from .repository import ProposalRepository
 from .sprints import revalidate_sprint
@@ -39,12 +39,11 @@ def _iso(value: datetime) -> str:
 
 
 def _parse_iso(value: str) -> datetime:
-    return datetime.fromisoformat(value.replace("Z", "+00:00")).astimezone(UTC)
+    return datetime.fromisoformat(value).astimezone(UTC)
 
 
 def _hash(value: Any) -> str:
-    encoded = json.dumps(value, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
-    return hashlib.sha256(encoded.encode("utf-8")).hexdigest()
+    return canonical_hash(value)
 
 
 def _normalize(value: Any) -> str:
@@ -79,7 +78,7 @@ def _contains_sprint_id(value: Any, expected_id: str) -> bool:
 class JiraControlledExecutionService:
     CONFIRMATION_TTL = timedelta(minutes=10)
     CONFIRMATION_PHRASE = "CREAR 1 TASK EN AT"
-    TERMINAL_STATUSES = {
+    TERMINAL_STATUSES: ClassVar[set[str]] = {
         "CREATED_VERIFIED",
         "CREATED_UNVERIFIED",
         "REJECTED",
@@ -92,11 +91,13 @@ class JiraControlledExecutionService:
         policy: JiraExecutionPolicy,
         gateway: ControlledJiraWriteGateway,
         now: Callable[[], datetime] = _utc_now,
+        create_core: ControlledJiraCreateCore | None = None,
     ) -> None:
         self.repository = repository
         self.policy = policy
         self.gateway = gateway
         self.now = now
+        self.create_core = create_core or ControlledJiraCreateCore(gateway)
 
     def prepare(
         self,
@@ -303,20 +304,27 @@ class JiraControlledExecutionService:
         intent["updated_at"] = _iso(now)
         real["submitted_at"] = _iso(now)
         intent["audit"].append(self._audit("SUBMITTED", username, now, "ONE_CREATE_CALL_SUBMITTED"))
-        self.repository.update_execution_intent(intent)
+        if not self.repository.transition_execution_intent(intent, "REAL_CONFIRMED"):
+            current = self._owned(execution_id, username)
+            if current["status"] in self.TERMINAL_STATUSES:
+                return {**current, "reused": True}
+            raise Objective4BError(
+                "La ejecucion ya fue reclamada. No se reenviara automaticamente."
+            )
 
         try:
             readback_fields = ["summary", "description", "issuetype", "assignee", "project", "labels"]
             sprint_field_id = (real.get("sprint_resolution") or {}).get("field_id")
             if sprint_field_id:
                 readback_fields.append(str(sprint_field_id))
-            gateway_result = await self.gateway.create_single_task_and_readback(
+            core_result = await self.create_core.create_and_verify(
                 username,
                 copy.deepcopy(real["payload"]["arguments"]),
                 readback_fields,
                 int(self.policy.document["execution_timeout_seconds"]),
+                sprint_resolution=real.get("sprint_resolution"),
             )
-        except Exception as exc:
+        except Exception as exc:  # noqa: BLE001 - preserva resultado incierto sin reintentar
             now = self.now()
             uncertain = bool(getattr(exc, "outcome_uncertain", False))
             intent["status"] = "UNKNOWN" if uncertain else "REJECTED"
@@ -330,26 +338,22 @@ class JiraControlledExecutionService:
             )
             return self.repository.update_execution_intent(intent)
 
-        issue_key = gateway_result.get("issue_key")
-        readback = gateway_result.get("readback")
-        checks = self._readback_checks(
-            readback,
-            issue_key,
-            real["payload"]["arguments"],
-            real.get("sprint_resolution"),
-        )
-        verified = bool(issue_key) and all(checks.values())
+        issue_key = core_result.get("issue_key")
+        checks = core_result["checks"]
+        verified = bool(core_result["verified"])
         now = self.now()
         intent["status"] = "CREATED_VERIFIED" if verified else "CREATED_UNVERIFIED"
         intent["updated_at"] = _iso(now)
         real["completed_at"] = _iso(now)
-        real["real_mcp_calls"] = int(gateway_result.get("real_mcp_calls", 2))
+        real["real_mcp_calls"] = int(core_result.get("real_mcp_calls", 2))
         real["issue_key"] = issue_key
         real["issue_url"] = (
             f"https://dpti.atlassian.net/browse/{issue_key}" if issue_key else None
         )
         real["result"] = "CREATED_AND_VERIFIED" if verified else "CREATED_READBACK_INCOMPLETE"
-        real["readback"] = {"checks": checks, "payload": readback}
+        real["readback"] = {"checks": checks, "payload": core_result.get("readback")}
+        real["create_elapsed_ms"] = core_result.get("create_elapsed_ms")
+        real["readback_elapsed_ms"] = core_result.get("readback_elapsed_ms")
         intent["audit"].append(
             self._audit(intent["status"], username, now, real["result"], real["real_mcp_calls"])
         )
@@ -469,50 +473,7 @@ class JiraControlledExecutionService:
         arguments: dict[str, Any],
         sprint_resolution: dict[str, Any] | None = None,
     ) -> dict[str, bool]:
-        issue = _nested_issue(payload)
-        if issue is None:
-            checks = {
-                "issue_key": bool(issue_key),
-                "summary": False,
-                "space": False,
-                "work_type": False,
-                "assignee": False,
-            }
-            if (sprint_resolution or {}).get("selected"):
-                checks["sprint"] = False
-            if ((arguments.get("additional_fields") or {}).get("parent") or {}).get("key"):
-                checks["parent"] = False
-            return checks
-        fields = issue.get("fields") or {}
-        project = fields.get("project") or {}
-        issue_type = fields.get("issuetype") or {}
-        assignee = fields.get("assignee") or {}
-        checks = {
-            "issue_key": _normalize(issue.get("key")) == _normalize(issue_key),
-            "summary": fields.get("summary") == arguments.get("summary"),
-            "space": _normalize(project.get("key")) == _normalize(arguments.get("projectKey")),
-            "work_type": (
-                _normalize(issue_type.get("name")) == _normalize(arguments.get("issueTypeName"))
-                or (
-                    _normalize(arguments.get("issueTypeName")) == "task"
-                    and _normalize(issue_type.get("name")) == "tarea"
-                )
-            ),
-            "assignee": str(assignee.get("accountId") or assignee.get("account_id") or "")
-            == str(arguments.get("assignee_account_id") or ""),
-        }
-        selected_sprint = (sprint_resolution or {}).get("selected") or {}
-        sprint_field_id = (sprint_resolution or {}).get("field_id")
-        if selected_sprint.get("id") and sprint_field_id:
-            checks["sprint"] = _contains_sprint_id(
-                fields.get(str(sprint_field_id)),
-                str(selected_sprint["id"]),
-            )
-        expected_parent = ((arguments.get("additional_fields") or {}).get("parent") or {}).get("key")
-        if expected_parent:
-            parent = fields.get("parent") or {}
-            checks["parent"] = _normalize(parent.get("key")) == _normalize(expected_parent)
-        return checks
+        return readback_checks(payload, issue_key, arguments, sprint_resolution)
 
     @staticmethod
     def _audit(
